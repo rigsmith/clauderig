@@ -23,6 +23,7 @@ type RestoreRootResult struct {
 	Files          int
 	SlugsRewritten int
 	Links          int // shared-memory symlinks recreated from the manifest
+	LinksKept      int // staged files skipped because a symlink already holds that path
 	Pruned         int // files removed as deleted-upstream (--prune)
 	// DesktopSessions counts Claude Desktop Code-session sidecars written this
 	// restore (claude-code-sessions/**/local_*.json). Desktop only rebuilds its
@@ -43,7 +44,11 @@ func (r *RestoreReport) DesktopSessions() int {
 }
 
 // isDesktopSessionSidecar reports whether a restored (slash) rel path is a
-// Desktop Code-session sidecar: claude-code-sessions/<org>/<user>/local_<id>.json.
+// Desktop Code-session sidecar:
+// claude-code-sessions/<accountUuid>/<organizationUuid>/local_<id>.json. Those
+// two uuids are the account's, straight from ~/.claude.json's oauthAccount — so
+// this tree is already partitioned per account, which is what devices.Account
+// records for the CLI side, where nothing else does.
 // The local_<id>.json shape is matched on the basename so a directory like
 // claude-code-sessions/org/local_cache/other.json isn't miscounted as a session.
 func isDesktopSessionSidecar(rel string) bool {
@@ -119,6 +124,7 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 		}
 		rewritten := map[string]bool{}
 		written := map[string]bool{}
+		links := linkCache{}
 		pm := permFor(r.ID)
 
 		files, err := listFiles(stageRoot)
@@ -136,6 +142,23 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 			}
 			src := filepath.Join(stageRoot, filepath.FromSlash(rel))
 			dst := filepath.Join(target, filepath.FromSlash(targetRel))
+
+			// A symlink at or above dst is this machine's own state — nearly always
+			// one of the shared-memory links restoreLinks recreates. Every write
+			// below follows a symlink, so restoring a staged file over one would
+			// silently clobber the link's target, or fail outright with EISDIR when
+			// the link points at a directory. Leave it alone (and count it as
+			// written so --prune doesn't collect it).
+			//
+			// Ancestors matter as much as the leaf: another machine holding this
+			// project as a real directory stages projects/<slug>/memory/MEMORY.md,
+			// and writing that descendant here follows the linked memory/ straight
+			// into the canonical project.
+			if isSymlink(dst) || links.underSymlink(target, dst) {
+				written[targetRel] = true
+				rr.LinksKept++
+				continue
+			}
 
 			if strings.HasSuffix(rel, ".json") {
 				if err := restoreJSON(src, dst, opts.Machine.Resolver(), pm); err != nil {
@@ -314,6 +337,38 @@ func listFiles(root string) ([]string, error) {
 		return nil
 	})
 	return out, err
+}
+
+// linkCache remembers which destination directories sit on or under a symlink,
+// so the ancestor walk costs one Lstat per directory across the whole restore
+// rather than one per path component per file.
+type linkCache map[string]bool
+
+// underSymlink reports whether any ancestor of dst, up to and excluding root, is
+// a symlink. root itself is never judged: the target directory is where the user
+// pointed restore, and following it is the whole intent.
+func (c linkCache) underSymlink(root, dst string) bool {
+	dir := filepath.Dir(dst)
+	if v, ok := c[dir]; ok {
+		return v
+	}
+	rel, err := filepath.Rel(root, dir)
+	// Only ".." itself, or a path BELOW it, is outside the root. A bare prefix
+	// test would also catch a real directory named "..memory" — Rel returns that
+	// name unchanged — and skip the very symlink check this exists to perform.
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false // at or outside the root — nothing left to walk
+	}
+	res := isSymlink(dir) || c.underSymlink(root, dir)
+	c[dir] = res
+	return res
+}
+
+// isSymlink reports whether p is a symlink, without following it. A missing path
+// is not a symlink, so a fresh machine takes the ordinary write path.
+func isSymlink(p string) bool {
+	fi, err := os.Lstat(p)
+	return err == nil && fi.Mode()&fs.ModeSymlink != 0
 }
 
 func copyFile(src, dst string, pm perm) error {

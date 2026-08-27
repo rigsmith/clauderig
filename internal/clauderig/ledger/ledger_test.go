@@ -224,3 +224,178 @@ func TestLoadAll_PrefersTheLaterSessionNotTheLaterWrite(t *testing.T) {
 		t.Errorf("a later write of an older session won: %+v", got["s"])
 	}
 }
+
+// Attribution is ranked and sticky: ground truth may upgrade an inference, but
+// nothing downgrades, and re-syncing under a different login cannot relabel a
+// session someone else's.
+func TestNote_AccountAttributionIsRankedAndSticky(t *testing.T) {
+	base := Entry{ID: "s1", End: time.Unix(100, 0).UTC(), Bytes: 10}
+
+	t.Run("inference is recorded when nothing is known", func(t *testing.T) {
+		l, _ := Open(t.TempDir(), "mbp")
+		e := base
+		e.Account, e.AccountSource = "acct-a", AccountFromSync
+		if !l.Note(e) {
+			t.Fatal("first note should write")
+		}
+		if a, s := l.Attribution("s1"); a != "acct-a" || s != AccountFromSync {
+			t.Errorf("got %q/%q", a, s)
+		}
+	})
+
+	t.Run("a later sync under another login does not relabel", func(t *testing.T) {
+		l, _ := Open(t.TempDir(), "mbp")
+		e := base
+		e.Account, e.AccountSource = "acct-a", AccountFromSync
+		l.Note(e)
+		// same rank, different account, and a changed transcript
+		e2 := base
+		e2.Bytes, e2.End = 20, time.Unix(200, 0).UTC()
+		e2.Account, e2.AccountSource = "acct-b", AccountFromSync
+		l.Note(e2)
+		if a, _ := l.Attribution("s1"); a != "acct-a" {
+			t.Errorf("sticky attribution lost: got %q, want acct-a", a)
+		}
+	})
+
+	t.Run("desktop ground truth upgrades an inference", func(t *testing.T) {
+		l, _ := Open(t.TempDir(), "mbp")
+		e := base
+		e.Account, e.AccountSource = "acct-a", AccountFromSync
+		l.Note(e)
+		up := base // byte-identical transcript: only the attribution improves
+		up.Account, up.AccountSource = "acct-b", AccountFromDesktop
+		if !l.Note(up) {
+			t.Fatal("an account upgrade must write even when the transcript is unchanged")
+		}
+		if a, s := l.Attribution("s1"); a != "acct-b" || s != AccountFromDesktop {
+			t.Errorf("got %q/%q, want acct-b/%s", a, s, AccountFromDesktop)
+		}
+	})
+
+	t.Run("ground truth is never downgraded", func(t *testing.T) {
+		l, _ := Open(t.TempDir(), "mbp")
+		e := base
+		e.Account, e.AccountSource = "acct-b", AccountFromDesktop
+		l.Note(e)
+		down := base
+		down.Bytes, down.End = 20, time.Unix(200, 0).UTC()
+		down.Account, down.AccountSource = "acct-a", AccountFromSync
+		l.Note(down)
+		if a, s := l.Attribution("s1"); a != "acct-b" || s != AccountFromDesktop {
+			t.Errorf("ground truth downgraded to %q/%q", a, s)
+		}
+	})
+
+	t.Run("an unattributed row stays writable and takes the first account", func(t *testing.T) {
+		l, _ := Open(t.TempDir(), "mbp")
+		l.Note(base)
+		if a, _ := l.Attribution("s1"); a != "" {
+			t.Fatalf("expected no attribution, got %q", a)
+		}
+		later := base
+		later.Account, later.AccountSource = "acct-a", AccountFromSync
+		if !l.Note(later) {
+			t.Fatal("adding a first attribution must write")
+		}
+		if a, _ := l.Attribution("s1"); a != "acct-a" {
+			t.Errorf("got %q", a)
+		}
+	})
+}
+
+// Note() ranks attribution within one device's file; the union is where two
+// files meet. Without ranking there too, a machine that later re-saw the same
+// transcript with no sidecar would replace another machine's Desktop ground
+// truth purely by having synced last.
+func TestLoadAll_KeepsGroundTruthAcrossDevices(t *testing.T) {
+	dir := t.TempDir()
+	end := time.Unix(100, 0).UTC()
+
+	// Machine A: ground truth, seen earlier.
+	a, _ := Open(dir, "machine-a")
+	a.Note(Entry{ID: "s1", End: end, Bytes: 10, Seen: time.Unix(500, 0).UTC(),
+		Account: "acct-truth", AccountSource: AccountFromDesktop})
+	if err := a.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Machine B: same transcript, no sidecar, synced LATER.
+	b, _ := Open(dir, "machine-b")
+	b.Note(Entry{ID: "s1", End: end, Bytes: 10, Seen: time.Unix(900, 0).UTC(),
+		Account: "acct-guess", AccountSource: AccountFromSync})
+	if err := b.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := LoadAll(dir)["s1"]
+	if got.Account != "acct-truth" || got.AccountSource != AccountFromDesktop {
+		t.Errorf("union = %q/%q, want acct-truth/%s — recency must not outrank ground truth",
+			got.Account, got.AccountSource, AccountFromDesktop)
+	}
+	// The rest of the row still comes from the newer sighting.
+	if !got.Seen.Equal(time.Unix(900, 0).UTC()) {
+		t.Errorf("Seen = %v, want the newer row's", got.Seen)
+	}
+}
+
+// An older twin that only contributes a better attribution is still a rewrite,
+// so its Seen stamp has to move — it is a tiebreak in the union.
+func TestNote_OlderTwinUpgradeStampsSeen(t *testing.T) {
+	l, _ := Open(t.TempDir(), "mbp")
+	newer := Entry{ID: "s1", End: time.Unix(200, 0).UTC(), Bytes: 20,
+		Seen: time.Unix(500, 0).UTC(), Account: "a", AccountSource: AccountFromSync}
+	l.Note(newer)
+
+	olderWithTruth := Entry{ID: "s1", End: time.Unix(100, 0).UTC(), Bytes: 10,
+		Seen: time.Unix(900, 0).UTC(), Account: "b", AccountSource: AccountFromDesktop}
+	if !l.Note(olderWithTruth) {
+		t.Fatal("an attribution upgrade from the older twin must write")
+	}
+	got := LoadAll(mustSave(t, l))["s1"]
+	if got.AccountSource != AccountFromDesktop || got.Account != "b" {
+		t.Errorf("attribution = %q/%q, want b/%s", got.Account, got.AccountSource, AccountFromDesktop)
+	}
+	if !got.End.Equal(time.Unix(200, 0).UTC()) || got.Bytes != 20 {
+		t.Errorf("the older twin overwrote transcript state: end=%v bytes=%d", got.End, got.Bytes)
+	}
+	if !got.Seen.Equal(time.Unix(900, 0).UTC()) {
+		t.Errorf("Seen = %v, want the writing row's stamp", got.Seen)
+	}
+}
+
+func mustSave(t *testing.T, l *Ledger) string {
+	t.Helper()
+	if err := l.Save(); err != nil {
+		t.Fatal(err)
+	}
+	return l.dir
+}
+
+// Two devices, both with only a sync-rank guess: the FIRST attribution owns the
+// session. Ranking alone is not enough — mergeAccount keeps its first argument
+// on a tie, and the union's first argument is the newer row, so a second
+// machine recording an already-staged transcript under its own live login would
+// otherwise relabel it on a routine sync.
+func TestLoadAll_EqualRankKeepsTheFirstAttribution(t *testing.T) {
+	dir := t.TempDir()
+	end := time.Unix(100, 0).UTC()
+
+	first, _ := Open(dir, "machine-a")
+	first.Note(Entry{ID: "s1", End: end, Bytes: 10, Seen: time.Unix(500, 0).UTC(),
+		Account: "acct-first", AccountSource: AccountFromSync})
+	if err := first.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	later, _ := Open(dir, "machine-b")
+	later.Note(Entry{ID: "s1", End: end, Bytes: 10, Seen: time.Unix(900, 0).UTC(),
+		Account: "acct-later", AccountSource: AccountFromSync})
+	if err := later.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := LoadAll(dir)["s1"]; got.Account != "acct-first" {
+		t.Errorf("union = %q, want acct-first — a routine sync must not relabel", got.Account)
+	}
+}

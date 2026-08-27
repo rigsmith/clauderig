@@ -8,6 +8,7 @@ import (
 
 	"github.com/rigsmith/rigsmith/core/gitrepo"
 	"github.com/rigsmith/rigsmith/core/pathmap"
+	"github.com/rigsmith/rigsmith/internal/clauderig/account"
 	"github.com/rigsmith/rigsmith/internal/clauderig/config"
 	"github.com/rigsmith/rigsmith/internal/clauderig/devices"
 	"github.com/rigsmith/rigsmith/internal/clauderig/engine"
@@ -58,11 +59,22 @@ func NewSyncCmd() *cobra.Command {
 			if cliLoc, st := cfg.RootLocation("cli", me); st == pathmap.StatusResolved {
 				claudeVer = config.DetectClaudeVersion(cliLoc)
 			}
+			// Attribution for ledger rows no Desktop sidecar covers. Read once,
+			// before the walk, so every row this sync records is stamped with the
+			// same account rather than one that could change mid-run.
+			// Read ONCE, and reuse for both writes below. Reading again for the
+			// device registry would let a login change (or one transiently
+			// failing read) mid-sync stamp ledger rows with one uuid and the
+			// registry with another — and the registry is what resolves an
+			// alias or email back to that uuid, so the two disagreeing breaks
+			// `search --account` for exactly those rows.
+			liveAcct, liveOrg, liveEmail, _ := account.LiveIdentity()
 			rep, serr := engine.Sync(engine.Options{
 				StagingDir: staging, Config: cfg, Machine: me, ClaudeVersion: claudeVer,
-				RetentionDays: cfg.Retention.HistoryDays,
-				MaxFileBytes:  cfg.Retention.MaxFileBytes,
-				Profiles:      engine.LocalProfileNames(),
+				RetentionDays:   cfg.Retention.HistoryDays,
+				MaxFileBytes:    cfg.Retention.MaxFileBytes,
+				Profiles:        engine.LocalProfileNames(),
+				LiveAccountUUID: liveAcct,
 			})
 			if rep != nil {
 				w := 0
@@ -124,9 +136,17 @@ func NewSyncCmd() *cobra.Command {
 				return nil
 			}
 
-			// Record this machine in the synced device registry.
+			// Record this machine in the synced device registry, together with the
+			// account it synced as — identity only (see devices.Account), and the
+			// only account provenance anything in the repo carries. Best-effort:
+			// an unreadable identity leaves the previous record standing and never
+			// costs anyone a sync.
 			if reg, err := devices.Load(staging); err == nil {
-				reg.Touch(me.Name, me.OS, claudeVer, time.Now())
+				var acct *devices.Account
+				if liveAcct != "" || liveOrg != "" || liveEmail != "" {
+					acct = &devices.Account{AccountUUID: liveAcct, OrganizationUUID: liveOrg, Email: liveEmail}
+				}
+				reg.Touch(me.Name, me.OS, claudeVer, acct, time.Now())
 				_ = reg.Save(staging)
 			}
 
