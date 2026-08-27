@@ -1,0 +1,71 @@
+# claudeRig
+
+Sync your Claude Code setup across machines — config, skills, and session
+history — to your own **private** git repo, and restore it on any computer with
+paths corrected across OSes and secrets never leaked. Pick up where you left off
+on a different machine.
+
+The fourth rig: a single statically-linked Go binary, zero runtime deps,
+installable by `curl | sh` / Homebrew / Scoop on any machine.
+
+```sh
+clauderig init                 # wizard: create/choose a PRIVATE repo, machine name, hooks
+clauderig sync                 # snapshot → redact secrets → rewrite paths → commit → push
+clauderig restore              # pull → rewrite slugs for this OS → merge (keeps local secrets)
+clauderig restore --dir /tmp/x # restore the CLI payload into a folder (inspect, don't touch ~/.claude)
+clauderig status               # remote reachability, last sync, per-root counts, hooks
+clauderig search "auth refactor"  # find a session by title/content, with a resume command
+clauderig pull                 # fetch latest into the staging repo (SessionStart hook target)
+clauderig account list         # show stored Claude Code logins (alias: ls / status)
+clauderig account run me@x.com # launch Claude Code as another account, isolated session
+clauderig mcp add ctx7 npx -y @upstash/context7-mcp   # manage MCP servers (list/add/remove/enable)
+rig worktree new feat/x        # sibling worktree + review window; never moves this session
+clauderig doctor               # health-check env + sync + worktree discipline (--fix repairs)
+clauderig hooks install        # SessionStart→pull, Stop→sync (portable, idempotent)
+clauderig ui                   # interactive dashboard
+```
+
+## What it does
+
+- **Cross-OS path correction.** A session captured at `/Users/john/Git/x` resumes
+  at `C:\Users\John\Git\x`. Project directory slugs and path values inside config
+  are re-derived for the target machine (`core/pathmap`).
+- **Secrets never leave the machine.** Secret-bearing fields are stripped before
+  commit; a tripwire fails the sync loudly if one slips past. Restore merges the
+  synced config back without clobbering your local secrets — a new machine
+  re-authenticates.
+- **Private repo, no exceptions.** The remote must be a GitHub repo that `gh`
+  confirms is private — created with `gh repo create --private` or an existing
+  one verified via `gh repo view`.
+- **Allowlist, default-deny.** Only curated files sync; the ~12 GB Desktop cache
+  tree is pruned, never descended.
+- **Bounded repo, unbounded memory.** 90-day retention on transcripts + a
+  size-based history squash — but every session sync ever staged keeps a
+  permanent row in the ledger, so an aged-out chat is still findable by title,
+  project and date.
+  Project memory is exempt — it's durable state, not a dated record, so it never
+  ages out of the sync.
+- **Find your sessions.** `clauderig search` locates a Claude Code session by
+  title or content across live and synced history and hands you a `claude
+  --resume` command. See [Commands](./commands#finding-a-session).
+- **Worktree discipline.** A guard hook plus `rig worktree` make branches +
+  PRs the default for Claude Code and keep a session from scrambling its chat
+  history by moving the working directory. See [Commands](./commands#worktree-discipline).
+- **Multiple accounts.** `clauderig account` captures, lists, and switches
+  between Claude Code logins, and can `run` a session as another account in an
+  isolated environment without touching your machine-wide login.
+- **MCP server management.** `clauderig mcp` adds, removes, lists, and toggles
+  MCP servers across user / project / local scopes — args-driven or via an
+  interactive screen (mirrors `claude mcp`).
+
+## Install
+
+```sh
+curl -fsSL https://rigsmith.sh/clauderig | sh    # once the release exists
+# or build from source (single Go module):
+go build -o clauderig ./cmd/clauderig
+```
+
+Requires `git` and the GitHub CLI (`gh`, authenticated) for the private-repo gate.
+
+- [All commands →](./commands)

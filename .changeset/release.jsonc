@@ -1,0 +1,27 @@
+{
+  // shiprig release pipeline — `shiprig release` is the one command that cuts a
+  // rigsmith release.
+  //
+  // rigsmith ships through GoReleaser in CI: pushing a vX.Y.Z tag fires
+  // .github/workflows/goreleaser.yml, which builds every target, signs them
+  // (Windows → Azure Trusted Signing, macOS → Apple notarization), and
+  // publishes everything — the GitHub Release, the Homebrew tap, and the npm
+  // wrapper packages. Those secrets only exist in CI, so build/sign/publish/
+  // release deliberately live there, NOT in this manifest.
+  //
+  // So `shiprig release` owns only the local half and hands off by pushing the
+  // tag:  version (bump + changelog) → commit → tag → push --follow-tags.
+  // The push triggers CI, which does the rest. Preview with
+  // `shiprig release --dry-run`.
+
+  "tool": "shiprig",
+
+  // Local steps only; the tag push hands the rest to GoReleaser (see above).
+  "order": ["version", "commit", "tag", "push"],
+
+  "steps": {
+    // The tag push is what triggers the CI release — the point of no return.
+    // Pause for confirmation before it leaves the machine.
+    "push": { "confirm": true }
+  }
+}

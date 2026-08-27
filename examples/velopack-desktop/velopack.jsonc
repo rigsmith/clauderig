@@ -1,0 +1,54 @@
+{
+  // velopack.json (or velopack.jsonc) — sits next to a .csproj to mark it a
+  // Velopack desktop app and configure `vpk pack`. Its presence is what hands the
+  // project from the dotnet adapter (which would push a NuGet package) to the
+  // velopack adapter (which builds installers + self-update feeds).
+  //
+  // Secrets are NOT stored here. Code-signing/notarization secrets (the macOS .p12
+  // password, AZURE_CLIENT_SECRET) come from the release signing config and are
+  // exposed to `vpk pack` as environment variables.
+
+  "packId": "Halyards",
+  "packTitle": "Halyards",
+  "packAuthors": "Bright Shore Technologies, Inc.",
+  "mainExe": "Halyards", // ".exe" is appended automatically for Windows channels
+
+  // Each channel is a .NET RID = one per-architecture self-update feed. macOS
+  // channels build only on a macOS host; win/linux cross-build anywhere.
+  "channels": ["osx-arm64", "osx-x64", "win-x64"],
+
+  "icon": {
+    "macos": "Halyards.Desktop/Assets/icons/halyards.icns",
+    "windows": "Halyards.Desktop/Assets/halyards.ico"
+  },
+
+  "output": "dist/releases", // default; where vpk writes installers + feeds
+
+  "macos": {
+    "bundleId": "com.halyards.desktop",
+    "signIdentity": "Developer ID Application: Bright Shore Technologies, Inc. (KBPC83WLD5)",
+    "notaryProfile": "halyards-notary", // an `xcrun notarytool store-credentials` profile
+    "dmg": true // wrap the notarized .app in a .dmg (default true)
+  },
+
+  "windows": {
+    // Windows code signing is host-dependent (vpk exposes different flags):
+    //
+    // • signTemplate — cross-compiling FROM macOS/Linux (the local-first path).
+    //   vpk runs this command per binary, substituting {{file}}; the adapter also
+    //   passes `--signExclude '\.dll$'` so only the .exe / Setup.exe are signed.
+    //   Here: jsign + Azure Trusted Signing, all from your Mac. $VARs are expanded
+    //   from the build env (vpk runs the command without a shell), so set
+    //   AZURE_CODESIGN_TOKEN (exported or in .env.local) to a Trusted Signing token;
+    //   the `--storepass` value is redacted from any echoed command.
+    "signTemplate": "jsign --storetype TRUSTEDSIGNING --keystore https://eus.codesigning.azure.net --storepass $AZURE_CODESIGN_TOKEN --alias MarylandPPT/MarylandPPT {{file}}",
+
+    // • trustedSigning — building natively ON Windows (e.g. a CI runner). vpk's
+    //   native --azureTrustedSignFile; used automatically when the host is Windows.
+    "trustedSigning": {
+      "endpoint": "https://eus.codesigning.azure.net",
+      "account": "MarylandPPT",
+      "profile": "MarylandPPT"
+    }
+  }
+}

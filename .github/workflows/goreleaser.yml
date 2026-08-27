@@ -1,0 +1,231 @@
+# Build and publish the four CLI binaries on a version tag.
+#
+# The release flow is two moments:
+#   1. `shiprig version` bumps versions + writes changelogs; you commit, push, and
+#      push a `vX.Y.Z` tag.
+#   2. This workflow fires on that tag, runs GoReleaser, and creates the GitHub
+#      Release with the cross-platform archives + checksums.
+#
+# scripts/install.sh (the `curl | sh` installer) downloads exactly the archives
+# GoReleaser produces here (rig_<version>_<os>_<arch>.tar.gz). Uses the built-in
+# GITHUB_TOKEN — no extra secret needed.
+#
+# Run it manually (Actions → Release binaries → Run workflow) for a dry run: it
+# builds + signs everything with the real secrets but publishes nothing (no
+# GitHub release, no tap push), and uploads the signed artifacts to inspect.
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # manual dry run — build + sign, publish nothing
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      # Fail fast on half-configured Windows signing. scripts/sign-windows.sh
+      # auto-enables once TRUSTED_SIGNING_ACCOUNT is set, then hard-requires the
+      # rest — but only at the post-build hook, ~1.5 min in. This catches an
+      # empty/typo'd Trusted Signing secret in seconds, naming exactly which one,
+      # before any build runs. With none set, signing is intentionally skipped
+      # (unsigned release) and this no-ops.
+      - name: Preflight — Windows signing secrets
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+        run: |
+          if [ -z "${TRUSTED_SIGNING_ACCOUNT:-}" ]; then
+            echo "Windows signing not configured (TRUSTED_SIGNING_ACCOUNT unset) — releases will be unsigned."
+            exit 0
+          fi
+          missing=
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+                   TRUSTED_SIGNING_ENDPOINT TRUSTED_SIGNING_ACCOUNT TRUSTED_SIGNING_PROFILE; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Windows signing is enabled (TRUSTED_SIGNING_ACCOUNT set) but these secrets are empty or unset:$missing"
+            exit 1
+          fi
+          echo "All Trusted Signing secrets present and non-empty."
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history so GoReleaser's git changelog is complete
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # The gitrepo tests need a git identity + a `main` default branch, same as
+      # ci.yml. Without this the temp repos default to `master` and the
+      # main-based fetch/merge tests fail.
+      - name: Configure git for tests
+        run: |
+          git config --global user.email ci@rigsmith.test
+          git config --global user.name rigsmith-ci
+          git config --global init.defaultBranch main
+
+      # CI runs on main/PRs but not on tags, so gate the release on the tests
+      # passing at the exact tagged commit — never publish binaries that fail.
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Vet
+        run: go vet ./...
+
+      # jsign signs the Windows .exe with Azure Trusted Signing during the build
+      # (see scripts/sign-windows.sh); it's a Java jar and needs a JRE.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch jsign
+        run: |
+          curl -fsSL -o /tmp/jsign.jar \
+            https://github.com/ebourg/jsign/releases/download/7.4/jsign-7.4.jar
+          echo "JSIGN_JAR=/tmp/jsign.jar" >> "$GITHUB_ENV"
+
+      # Node builds the npm binary-wrapper packages; registry-url wires npm auth.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      # Keep the rigsmith/winget-pkgs fork's master current with upstream before
+      # GoReleaser branches off it to open the winget PRs. winget-pkgs moves
+      # thousands of commits a week; a stale fork turns each PR into a massive,
+      # conflicting diff instead of a clean single-manifest add. Needs WINGET_TOKEN
+      # (write access to the fork); no-ops without it, since the winget upload is
+      # skipped then anyway.
+      #
+      # Never fatal. This is hygiene for one of several publish targets, and it
+      # runs before the build — a failure here used to abort the entire release
+      # with nothing published at all. v1.5.0 was tagged and then shipped nothing
+      # for exactly this reason: `gh repo sync` refuses when upstream has touched
+      # its own workflow files unless the token carries the `workflow` scope, which
+      # a `public_repo` PAT does not. A stale fork costs a messier winget diff; a
+      # failed release costs the release.
+      - name: Sync winget-pkgs fork with upstream
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "WINGET_TOKEN unset — winget upload is skipped, nothing to sync."
+            exit 0
+          fi
+          if ! gh repo sync rigsmith/winget-pkgs --source microsoft/winget-pkgs --branch master; then
+            echo "::warning::Could not sync the winget-pkgs fork — the winget PRs will branch from a stale master. If this is the `workflow` scope error, add that scope to WINGET_TOKEN. Continuing; the release does not depend on this."
+          fi
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          # A manual run is a snapshot: it builds + signs but skips every publish
+          # (no GitHub release, tap push, or npm). A tag does the real release.
+          args: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && 'release --snapshot --clean'
+                || 'release --clean' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cross-repo token so GoReleaser can commit the casks to
+          # rigsmith/homebrew-tap (the default GITHUB_TOKEN can't reach it).
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Classic PAT (public_repo) with write access to the rigsmith/winget-pkgs
+          # fork; GoReleaser pushes each package's manifest branch there and opens the
+          # PR to microsoft/winget-pkgs. Absent/empty ⇒ winget entries skip (their
+          # skip_upload gates on this being non-empty), so the release never fails.
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          # Cross-repo token so GoReleaser can push the Scoop manifest to
+          # rigsmith/scoop-bucket (the default GITHUB_TOKEN can't reach it). Absent/
+          # empty ⇒ the scoop entry skips (its skip_upload gates on isEnvSet), so the
+          # release never fails on a missing bucket token.
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          # macOS sign + notarize (Apple Developer ID). Notarization auto-enables
+          # once MACOS_SIGN_P12 is set; absent these, releases are unsigned.
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          # Windows Authenticode via Azure Trusted Signing (jsign). Signing
+          # auto-enables once TRUSTED_SIGNING_ACCOUNT is set; absent these, the
+          # Windows binaries ship unsigned.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+
+      # Build the npm binary-wrapper packages from dist/ (the prebuilt — and on a
+      # tag, signed — binaries). A tag publishes them to npm; a manual dry run
+      # validates packaging with `npm publish --dry-run` (packs each, no upload).
+      - name: npm wrapper packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            node scripts/npm/build-packages.mjs --dry-publish
+          else
+            node scripts/npm/build-packages.mjs --publish
+          fi
+
+      # Submit to winget via komac, which updates the PUBLISHED manifest rather
+      # than writing one from config — so Commands, Tags, Copyright,
+      # PublisherSupportUrl and the release notes survive a version bump. The
+      # GoReleaser winget publisher is disabled for this reason (see
+      # .goreleaser.yaml) after it dropped all of them from the 1.5.1 manifests.
+      #
+      # winget-submit.sh generates to a directory, corrects komac's `exe`
+      # misdetection of clauderig.exe, verifies, and only then submits — so the
+      # manifest check is a gate here, not the after-the-fact alarm it could only
+      # be while GoReleaser opened the PRs itself.
+      #
+      # Tag pushes only: a manual dry run publishes no release for komac to point
+      # winget at. Never fatal — the release itself is already out by now, and a
+      # winget submission can be re-run by hand.
+      - name: Submit to winget (komac)
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          # The secrets context is not available in a step `if`, so gate here.
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "WINGET_TOKEN unset — skipping the winget submission."
+            exit 0
+          fi
+          curl -fsSL -o /tmp/komac.tar.gz \
+            https://github.com/russellbanks/Komac/releases/download/v2.16.0/komac-2.16.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf /tmp/komac.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/komac /usr/local/bin/komac
+          komac --version
+          sh scripts/winget-submit.sh "${GITHUB_REF_NAME#v}" --submit
+
+      # Dry run only: hand back the built + signed artifacts to inspect locally
+      # (codesign --verify / spctl on the mac binaries, the casks, checksums).
+      # Nothing was published.
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: dryrun-dist
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+            dist/homebrew/Casks/*.rb
+            npm/dist/**/package.json
+          retention-days: 7

@@ -1,0 +1,755 @@
+package cli
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/rigsmith/rigsmith/internal/rig/config"
+	"github.com/rigsmith/rigsmith/internal/rig/detect"
+	"github.com/spf13/cobra"
+)
+
+// devVerbCmd builds a dev-loop verb (build/test/run/format/lint/typecheck/clean)
+// with workspace awareness: an optional project selector scopes the verb to one
+// package's directory, and (when supportsAll) `--all` runs it across every
+// workspace package in dependency order, narrowable with `--filter`.
+func devVerbCmd(verb, short string, supportsAll bool, aliases ...string) *cobra.Command {
+	var (
+		all       bool
+		filter    string
+		watch     bool
+		forcePick bool
+		presets   []presetFlag
+	)
+	cmd := &cobra.Command{
+		Use:               verb + " [project]",
+		Short:             short,
+		Aliases:           aliases,
+		ValidArgsFunction: verbCompletion(verb),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, _ := os.Getwd()
+			root := resolveRoot(cwd)
+			// Activate any selected env presets for this run (applied as the top
+			// env layer in commandEnv).
+			presetEnv = activePresetEnv(root, presets)
+
+			// Split at `--` BEFORE any dispatch. Tokens the user put after it
+			// belong to the underlying command and are never a selector:
+			// `rig test -- --logger=trx` forwards a flag, it does not name a test
+			// class. Computing this later meant --watch, rebuild and the bare
+			// picker each saw the forwarded tail as arguments — so
+			// `rig build --watch -- --verbose` read `--verbose` as a project name,
+			// and `rig build -- --verbose` skipped workspace selection entirely.
+			//
+			// selectors is what NAMES something; args stays whole, because the
+			// forwarded tokens still have to reach the command.
+			selectors := argsBeforeDash(cmd, args)
+
+			if all {
+				if watch {
+					return fmt.Errorf("--watch cannot be combined with --all")
+				}
+				return runAcross(cmd, root, verb, filter, args)
+			}
+			// `--watch` at any flag position reroutes through the watch path
+			// (the trailing form is folded onto the `watch` subcommand by the
+			// pre-parse pipeline; both land in runWatchVerb).
+			if watch {
+				return runWatchVerb(cmd, verb, selectors, args)
+			}
+			// rebuild sequences clean → build, so it has no single argv to ride the
+			// generic project picker (which keys off each package's one command); it
+			// gets its own arg-scoping + package picker.
+			if verb == "rebuild" {
+				return runRebuildVerb(cmd, root, selectors, args, forcePick)
+			}
+			// `-i`/`--interactive` (no project arg) always opens the picker — even
+			// when a single target would otherwise run directly. `run` lists every
+			// runnable package and surfaced script; the --all verbs list every
+			// package (with "All packages"). With an explicit project arg the arg
+			// wins (below).
+			if forcePick && len(selectors) == 0 && (supportsAll || verb == "run") {
+				if handled, herr := offerWorkspaceChoice(cmd, root, verb, supportsAll, true); handled {
+					return herr
+				}
+			}
+			// A first arg that names a package scopes the verb to that package.
+			// `run` matches against the per-binary expansion so `rig run rig`
+			// resolves a cmd/rig main, not just a module.
+			if len(selectors) > 0 {
+				var ts []target
+				if verb == "run" {
+					ts = runTargets(cdContext(cmd), root)
+				} else {
+					ts = discoverWorkspace(cdContext(cmd), root, excludeFor(root))
+				}
+				// Tiered by name (exact beats prefix beats substring), then
+				// narrowed by proximity: the copy you are standing in — or the
+				// one nearest cwd — takes a tie outright. Matched against
+				// selectors, not args: a token after `--` belongs to the
+				// underlying command and never names a project.
+				matches := nearestTargets(cwd, matchTargets(ts, selectors[0]))
+				// `rig run <name>`/`rig build <name>` matching several targets is
+				// usually one project duplicated across paths (a nested worktree).
+				// Offer a picker rather than failing or silently guessing. Other verbs
+				// keep the single-match rule: an ambiguous arg falls through (e.g.
+				// `rig test <filter>`).
+				if (verb == "run" || verb == "build") && len(matches) > 1 {
+					return verbAmbiguousPick(cmd, root, verb, selectors[0], matches, args[1:])
+				}
+				if len(matches) == 1 {
+					t := matches[0]
+					argv, has := devCommandFor(t, verb, root)
+					if !has {
+						return fmt.Errorf("verb %q has no mapping for ecosystem %q", verb, t.Eco)
+					}
+					if verb == "format" {
+						if err := requireDotnetFormatter(cmd, t.Eco, root); err != nil {
+							return err
+						}
+					}
+					return runCommand(cmd, t.Dir, append(argv, args[1:]...))
+				}
+			}
+			// Default: the primary ecosystem at the repo root. Resolve it, but
+			// defer a failure — a repo can have no single primary (e.g. .NET
+			// solutions nested in subdirs with nothing at the root) yet still have
+			// runnable subprojects the picker below can offer.
+			eco, ecoErr := resolvePrimary(cwd, root)
+			// `rig test <class|~filter>` in a .NET repo: an arg that names no
+			// package is a test-class query / filter shorthand (TestVerb).
+			if ecoErr == nil && verb == "test" && eco == detect.DotNet && len(selectors) > 0 {
+				return runDotnetTest(cmd, root, args, false)
+			}
+			// A bare verb at a workspace root (packages only in subdirs) has no
+			// single target — offer a picker instead of running a doomed root
+			// command. For --all-capable verbs the picker leads with "All
+			// packages"; `run` gets a single-select of the runnable packages. This
+			// runs before the primary is required, so it works even when no
+			// primary resolves (the picker scopes the verb to a chosen package).
+			if len(selectors) == 0 && (supportsAll || verb == "run") {
+				if handled, herr := offerWorkspaceChoice(cmd, root, verb, supportsAll, false); handled {
+					return herr
+				}
+			}
+			// The picker didn't handle it — the root command needs the primary, so
+			// surface the unresolved-ecosystem error now.
+			if ecoErr != nil {
+				return ecoErr
+			}
+			argv, ok := resolveVerbCommand(eco, verb, root)
+			if !ok {
+				return fmt.Errorf("verb %q has no mapping for ecosystem %q yet", verb, eco)
+			}
+			if verb == "format" {
+				if err := requireDotnetFormatter(cmd, eco, root); err != nil {
+					return err
+				}
+			}
+			return runCommand(cmd, root, append(argv, args...))
+		},
+	}
+	if supportsAll {
+		cmd.Flags().BoolVarP(&all, "all", "a", false, "run across every workspace package (dependency order)")
+		cmd.Flags().StringVar(&filter, "filter", "", "with --all, limit to packages matching this glob")
+	}
+	if watchableVerb(verb) {
+		cmd.Flags().BoolVarP(&watch, "watch", "w", false, "run in the ecosystem's watch mode (re-run on change)")
+	}
+	if supportsAll || verb == "run" || verb == "rebuild" {
+		usage := "always open the picker (choose a package)"
+		if verb == "run" {
+			usage = "always open the picker (choose a package or script to run)"
+		}
+		cmd.Flags().BoolVarP(&forcePick, "interactive", "i", false, usage)
+	}
+	presets = registerPresetFlags(cmd)
+	// Whatever the verb doesn't consume is appended to the ecosystem command's
+	// argv, so `rig <verb> -- <flags>` reaches the underlying tool — the escape
+	// hatch an unknown flag points at.
+	return markForwards(cmd, "rig "+verb+" -- --verbose")
+}
+
+// verbCompletion picks the [project] completion source for a verb. `run`
+// resolves its arg against the per-binary run targets (runTargets), so its
+// completion must too — otherwise `rig run <TAB>` would suggest Go module names
+// while `rig run <name>` only matches the expanded cmd/* binaries. Every other
+// verb completes against the module-level workspace names.
+func verbCompletion(verb string) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	if verb == "run" {
+		return runTargetCompletion
+	}
+	return workspaceNameCompletion
+}
+
+// runTargetCompletion completes `rig run`'s [project] arg with the expanded run
+// targets (cmd/rig, cmd/clauderig, … for a multi-binary Go repo), matching how
+// the arg is resolved. Never errors: completion must never break the shell.
+func runTargetCompletion(cmd *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	cwd, _ := os.Getwd()
+	root := resolveRoot(cwd)
+	ts := runTargets(cdContext(cmd), root)
+	names := make([]string, 0, len(ts))
+	for _, t := range ts {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+	return names, cobra.ShellCompDirectiveNoFileComp
+}
+
+// workspaceNameCompletion completes a [project] arg with the discovered
+// workspace package names (every ecosystem). It is the dynamic-completion
+// source shared by the dev verbs and kill — the Go analogue of the .NET rig's
+// Completions wiring (cobra owns the shell protocol there played by the
+// [suggest] directive).
+func workspaceNameCompletion(cmd *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	cwd, _ := os.Getwd()
+	root := resolveRoot(cwd)
+	ts := discoverWorkspace(cdContext(cmd), root, excludeFor(root))
+	names := make([]string, 0, len(ts))
+	for _, t := range ts {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+	return names, cobra.ShellCompDirectiveNoFileComp
+}
+
+// runnableProjectCompletion completes a [project] arg with the repo's runnable
+// .NET project short names — the .NET rig's Completions.RunnableProjects, for
+// the verbs whose positional resolves through resolveRunProject (publish,
+// default). Never errors: completion must never break the shell.
+func runnableProjectCompletion(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	cwd, _ := os.Getwd()
+	root := resolveRoot(cwd)
+	cfg, _ := config.LoadMerged(root)
+	var names []string
+	for _, p := range discoverDotnet(root, cfg.Solution, cfg.Exclude) {
+		if p.IsRunnable() {
+			names = append(names, p.ShortName())
+		}
+	}
+	sort.Strings(names)
+	return names, cobra.ShellCompDirectiveNoFileComp
+}
+
+// runAcross runs the verb in every workspace package (topo order), optionally
+// filtered, skipping packages whose ecosystem doesn't map the verb. On an
+// interactive terminal it renders a live dashboard (per-package status +
+// streamed output); otherwise it streams sequentially as plain output.
+func runAcross(cmd *cobra.Command, root, verb, filter string, args []string) error {
+	targets := topoSort(filterTargets(discoverWorkspace(cdContext(cmd), root, excludeFor(root)), filter))
+	if len(targets) == 0 {
+		return fmt.Errorf("no workspace packages found%s", filterNote(filter))
+	}
+	// Resolve the runnable tasks up front (packages whose ecosystem maps the verb).
+	var tasks []allTask
+	for _, t := range targets {
+		argv, ok := devCommandFor(t, verb, root)
+		if !ok {
+			continue
+		}
+		rel, err := filepath.Rel(root, t.Dir)
+		if err != nil {
+			rel = t.Dir
+		}
+		tasks = append(tasks, allTask{name: t.Name, eco: t.Eco, dir: t.Dir, rel: rel, argv: append(argv, args...)})
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("no workspace package maps verb %q", verb)
+	}
+
+	if allDashboardEligible() {
+		return runAcrossDashboard(cmd, tasks, verb)
+	}
+
+	// Plain sequential path (CI, piped, --quiet, --dry-run): abort on first failure.
+	out := cmd.OutOrStdout()
+	for _, t := range tasks {
+		fmt.Fprintln(out, dimStyle.Render(fmt.Sprintf("· %s (%s)", t.name, t.eco)))
+		if err := runCommand(cmd, t.dir, t.argv); err != nil {
+			return fmt.Errorf("%s in %s: %w", verb, t.name, err)
+		}
+	}
+	return nil
+}
+
+// offerWorkspaceChoice handles a bare dev verb at a workspace root: when packages
+// live only in subdirectories (no buildable package at the root) and several
+// exist, running the verb at the root has no single target. On an interactive
+// terminal it offers a picker (with "All packages" → the --all dashboard when
+// offerAll is set, e.g. build/test; `run` gets a grouped picker of runnable
+// packages and surfaced scripts); off a TTY it returns a helpful error.
+// handled=false lets the normal root command run (single-package repos, or a
+// package at the root).
+//
+// forcePick (`-i`/`--interactive`) always shows the picker: a runnable root package (and,
+// for `run`, the surfaced scripts) is included even when one obvious target
+// exists, and a single candidate still opens the picker rather than running.
+
+// rootCommandStands reports whether a bare `rig <verb>` runs the ROOT command
+// rather than dispatching to a workspace picker.
+//
+// Shared with `rig explain`, which must answer the same question: explain
+// prints the ecosystem's root command, and that is only the truth when this is
+// true. In a Go module whose mains live under cmd/, a bare `rig run` opens the
+// picker — printing `go run .` there describes a command the run path
+// deliberately avoids, which is the one failure explain exists to prevent.
+//
+// Extracted rather than reimplemented for the same reason: a second copy of
+// this decision would drift, and explain would go back to being confidently
+// wrong.
+func rootCommandStands(verb string, rootHasPackage bool, tasks, scripts int) bool {
+	if rootHasPackage || tasks+scripts == 0 {
+		return true
+	}
+	// --all-capable verbs (build/test/…): a lone subpackage falls through to the
+	// root command; several open the package picker (with "All packages").
+	// `run` never falls through here — it offers its own choice.
+	return verb != "run" && tasks == 1
+}
+
+// workspaceSurvey is what the dispatch decision is made from: the runnable
+// targets, the surfaced scripts, and whether the repo root is itself buildable.
+type workspaceSurvey struct {
+	tasks          []allTask
+	scripts        []scriptEntry
+	rootHasPackage bool
+	defaultProject string
+}
+
+// surveyWorkspace gathers what a bare `rig <verb>` would dispatch on.
+//
+// Extracted so `rig explain` can reach the SAME answer through the same code:
+// explain prints the ecosystem's root command, which is only the truth when the
+// root command is what would actually run. A second implementation of this
+// would drift, and explain would go back to describing a command nobody
+// executes.
+func surveyWorkspace(cmd *cobra.Command, root, verb string, forcePick bool) workspaceSurvey {
+	// `run` expands each Go module into its individual binaries (cmd/rig, …) so a
+	// multi-binary repo offers each one; other verbs operate at the module level.
+	var raw []target
+	if verb == "run" {
+		raw = runTargets(cdContext(cmd), root)
+	} else {
+		raw = discoverWorkspace(cdContext(cmd), root, excludeFor(root))
+	}
+	targets := topoSort(filterTargets(raw, ""))
+
+	// `run` additionally offers the repo's surfaced scripts (package.json
+	// scripts, .rig.json commands, Go scripts//cmd verbs) as a second group — the
+	// same scripts `rig <name>` runs. Those Go script verbs (scripts/…, go.work
+	// cmd entries) are also main packages, so they'd appear in the expanded run
+	// targets too; their directories are collected here to dedup them out of the
+	// Projects group, keeping each binary in exactly one group.
+	var scripts []scriptEntry
+	var defaultProject string
+	scriptDirs := map[string]bool{}
+	if verb == "run" {
+		cfg, _ := config.LoadMerged(root)
+		defaultProject = cfg.DefaultProject
+		scripts = discoverScripts(root, cfg)
+		for _, e := range scripts {
+			if e.eco == "go" {
+				scriptDirs[e.loc] = true
+			}
+		}
+	}
+
+	var tasks []allTask
+	rootHasPackage := false
+	for _, t := range targets {
+		rel, rerr := filepath.Rel(root, t.Dir)
+		if rerr != nil {
+			rel = t.Dir
+		}
+		rel = filepath.ToSlash(rel)
+		argv, ok := devCommandFor(t, verb, root)
+		if !ok {
+			continue
+		}
+		if verb == "run" {
+			// For `run`, list only packages that are actually runnable (a Go dir
+			// with a main package, etc.) so libraries don't clutter the picker.
+			if !isRunnable(t) {
+				continue
+			}
+			// A binary already surfaced as a script verb belongs to the Scripts
+			// group; don't also list it under Projects.
+			if t.Eco == detect.Go && scriptDirs[rel] {
+				continue
+			}
+		}
+		// A target at the repo root only counts as "the root package" once it
+		// has cleared the same filters that admit it to tasks. A Go module whose
+		// mains live under cmd/ (no `package main` at the root) is not runnable,
+		// so for `run` it must not suppress the picker + scripts by masquerading
+		// as a runnable root — otherwise rig falls through to a doomed `go run .`.
+		if rel == "." {
+			rootHasPackage = true
+		}
+		tasks = append(tasks, allTask{name: t.Name, eco: t.Eco, dir: t.Dir, rel: rel, argv: argv})
+	}
+
+	// A directly-runnable root (a Go module with a `package main` at its root, or
+	// a single-package app) runs on a plain `rig run` — only show the surfaced
+	// scripts alongside it when the user explicitly opens the picker.
+	if verb == "run" && rootHasPackage && !forcePick {
+		scripts = nil
+	}
+	return workspaceSurvey{tasks: tasks, scripts: scripts, rootHasPackage: rootHasPackage, defaultProject: defaultProject}
+}
+
+func offerWorkspaceChoice(cmd *cobra.Command, root, verb string, offerAll, forcePick bool) (handled bool, err error) {
+	survey := surveyWorkspace(cmd, root, verb, forcePick)
+	tasks, scripts := survey.tasks, survey.scripts
+	rootHasPackage, defaultProject := survey.rootHasPackage, survey.defaultProject
+
+	if forcePick {
+		// `-i`/`--interactive`: always the picker, including a runnable root package.
+		if verb == "run" {
+			if len(tasks)+len(scripts) == 0 {
+				return true, fmt.Errorf("nothing runnable here to pick from")
+			}
+			return offerRunChoice(cmd, root, tasks, scripts, defaultProject, true)
+		}
+		if len(tasks) == 0 {
+			return true, fmt.Errorf("no %s targets here to pick from", verb)
+		}
+		if !interactive() {
+			return true, fmt.Errorf("-i/--interactive needs an interactive terminal; run `rig %s <project>`", verb)
+		}
+		return dispatchVerbPick(cmd, verb, tasks, offerAll)
+	}
+
+	// A buildable package at the root, or nothing to offer: the normal root
+	// command is the right thing — let it run (or produce its own error).
+	// `rig explain` asks the same question through rootCommandStands, so the
+	// two can never disagree about whether the root command is what runs.
+	if rootCommandStands(verb, rootHasPackage, len(tasks), len(scripts)) {
+		return false, nil
+	}
+
+	if verb == "run" {
+		return offerRunChoice(cmd, root, tasks, scripts, defaultProject, false)
+	}
+
+	if !interactive() {
+		hint := "run `rig " + verb + " <project>`"
+		if offerAll {
+			hint = "run `rig " + verb + " --all` or `rig " + verb + " <project>`"
+		}
+		return true, fmt.Errorf(
+			"no single %s target here — this is a workspace root with %d packages; %s",
+			verb, len(tasks), hint)
+	}
+	return dispatchVerbPick(cmd, verb, tasks, offerAll)
+}
+
+// dispatchVerbPick shows the package picker for an --all-capable verb and runs
+// the choice: "All packages" → the --all dashboard, a package → its command,
+// cancel → nothing. Shared by the implicit multi-package case and `-i`/`--interactive`.
+func dispatchVerbPick(cmd *cobra.Command, verb string, tasks []allTask, offerAll bool) (handled bool, err error) {
+	switch choice := pickWorkspaceVerbTarget(verb, tasks, offerAll); choice {
+	case pickCancel:
+		return true, nil
+	case pickAll:
+		return true, runAcrossDashboard(cmd, tasks, verb)
+	default:
+		t := tasks[choice]
+		return true, runCommand(cmd, t.dir, t.argv)
+	}
+}
+
+// verbAmbiguousPick handles `rig <verb> <name>` when the name matches several
+// targets — typically one project checked out in more than one path (e.g. a
+// nested worktree). Rather than fail, it lets the user disambiguate: on a TTY a
+// picker (name · eco · path); off a TTY the candidate list plus the remedies
+// that actually resolve it (see ambiguousTasks). Copies the verb can't act on
+// are dropped (`run` skips non-runnable ones), which may resolve the ambiguity
+// on its own.
+func verbAmbiguousPick(cmd *cobra.Command, root, verb, query string, matches []target, forwarded []string) error {
+	var tasks []allTask
+	for _, t := range matches {
+		if verb == "run" && !isRunnable(t) {
+			continue
+		}
+		argv, ok := devCommandFor(t, verb, root)
+		if !ok {
+			continue
+		}
+		tasks = append(tasks, allTask{
+			name: t.Name, eco: t.Eco, dir: t.Dir,
+			rel: relSlash(root, t.Dir), argv: append(argv, forwarded...),
+		})
+	}
+	switch len(tasks) {
+	case 0:
+		// `run` filtered to runnable copies above, so its "no match" is specifically
+		// about runnability; other verbs act on every discovered package.
+		if verb == "run" {
+			return fmt.Errorf("no runnable project matches %q", query)
+		}
+		return fmt.Errorf("no project matches %q", query)
+	case 1:
+		return runCommand(cmd, tasks[0].dir, tasks[0].argv)
+	}
+	return ambiguousTasks(cmd, root, verb, query, "", tasks)
+}
+
+// ambiguousTasks is the one place a project query that matches several copies is
+// resolved, whether the query came from an argument or from the configured
+// defaultProject (named by source). On a TTY it offers the picker; off a TTY it
+// prints the candidates as clean lines — the error box would reflow a multi-line
+// message — followed by the exact .rig.json line that excludes the copy you
+// probably don't want, then returns a short, actionable error.
+//
+// The implicit path routing through here is the point: `rig run` with a
+// defaultProject and `rig run <that same name>` must resolve identically, so a
+// bare `rig run` can never quietly launch a stale copy that an explicit run
+// would have refused.
+func ambiguousTasks(cmd *cobra.Command, root, verb, query, source string, tasks []allTask) error {
+	// Lead with a plain word, never the query: the error styling title-cases the
+	// first word, which would rewrite the project name the user typed.
+	subject := fmt.Sprintf("name %q", query)
+	if source != "" {
+		subject = fmt.Sprintf("configured %s %q", source, query)
+	}
+	if interactive() {
+		choice := pickWorkspaceVerbTarget(verb, tasks, false)
+		if choice < 0 || choice >= len(tasks) { // pickCancel (or any out-of-range) → no-op
+			return nil
+		}
+		t := tasks[choice]
+		return runCommand(cmd, t.dir, t.argv)
+	}
+
+	errOut := cmd.ErrOrStderr()
+	nameW := 0
+	for _, t := range tasks {
+		nameW = max(nameW, runeLen(t.name))
+	}
+	for _, t := range tasks {
+		line := fmt.Sprintf("  %s  %s", padRight(t.name, nameW), taskPath(t))
+		// Say what the extra copy IS when we know — a nested worktree, and
+		// whether `rig prune` would already remove it.
+		if note := nestedWorktreeNote(cdContext(cmd), root, t.dir); note != "" {
+			line += "  · " + note
+		}
+		fmt.Fprintln(errOut, dimStyle.Render(line))
+	}
+	fmt.Fprintf(errOut, "%s\n", dimStyle.Render("  exclude the copy you don't want — add to "+config.FileName+":"))
+	fmt.Fprintf(errOut, "%s\n", dimStyle.Render(`    "exclude": ["`+excludeHintGlob(root, tasks)+`"]`))
+	// Narrowing the name only helps when the collision is a partial match;
+	// against two copies of one project there is no narrower name to type.
+	remedies := fmt.Sprintf("run `rig %s` from the target directory, or add the exclude line above to %s", verb, config.FileName)
+	if !allSameName(tasks) {
+		remedies = "narrow the name, " + remedies
+	}
+	return fmt.Errorf("%s matches %d projects (listed above) — %s", subject, len(tasks), remedies)
+}
+
+// allSameName reports whether every candidate carries the same project name —
+// i.e. the ambiguity is one project checked out twice, not a loose query.
+func allSameName(tasks []allTask) bool {
+	for _, t := range tasks {
+		if !strings.EqualFold(t.name, tasks[0].name) {
+			return false
+		}
+	}
+	return true
+}
+
+// excludeHintGlob picks the glob to suggest for hiding the redundant copy. A
+// copy inside a nested worktree is best excluded by the whole worktree
+// directory ("<worktree>/*", whose '*' spans '/'), which also hides every other
+// project it duplicates; otherwise it is the copy's own repo-relative path.
+// Paths — not just names — are valid `exclude` entries, which is exactly what
+// the printed line has to demonstrate: with two copies sharing one name, a
+// name glob would hide both.
+func excludeHintGlob(root string, tasks []allTask) string {
+	fallback := taskPath(tasks[len(tasks)-1])
+	for _, t := range tasks {
+		if wt, ok := nestedWorktreeFor(root, t.dir); ok {
+			return relSlash(root, wt) + "/*"
+		}
+	}
+	return fallback
+}
+
+// offerRunChoice resolves a bare `rig run` at a workspace root over the runnable
+// packages and surfaced scripts. A configured defaultProject naming exactly one
+// runnable package wins outright (with its path echoed, since nothing else in
+// the output would tell you which copy started); naming several is ambiguous and
+// is reported exactly as `rig run <name>` would report it. Otherwise a single
+// target runs directly and several open the grouped picker (Projects, then
+// Scripts). Off a TTY it returns a helpful error. With forcePick set
+// (`-i`/`--interactive`) the picker always opens, even when a default or a lone
+// candidate would otherwise run.
+func offerRunChoice(cmd *cobra.Command, root string, tasks []allTask, scripts []scriptEntry, defaultProject string, forcePick bool) (handled bool, err error) {
+	if !forcePick {
+		switch hits := preferredRunTasks(tasks, defaultProject); len(hits) {
+		case 1:
+			t := hits[0]
+			noteResolvedDefault(cmd, defaultProject, t)
+			return true, runCommand(cmd, t.dir, t.argv)
+		case 0: // no default, or it names nothing runnable — fall through
+		default:
+			return true, ambiguousTasks(cmd, root, "run", defaultProject, "defaultProject", hits)
+		}
+		if len(tasks)+len(scripts) == 1 {
+			if len(tasks) == 1 {
+				t := tasks[0]
+				return true, runCommand(cmd, t.dir, t.argv)
+			}
+			return true, scripts[0].run(cmd, nil)
+		}
+	}
+	if !interactive() {
+		// Off a TTY there's no picker. Point at defaultProject when it's the
+		// relevant lever: with -i it's what a plain `rig run` would use; without
+		// it, a configured-but-unmatched default is why we're here.
+		switch {
+		case forcePick && defaultProject != "":
+			return true, fmt.Errorf(
+				"-i/--interactive needs an interactive terminal; without it `rig run` uses the configured defaultProject %q, or name one: `rig run <project>`",
+				defaultProject)
+		case forcePick:
+			return true, fmt.Errorf("-i/--interactive needs an interactive terminal; run `rig run <project>` instead")
+		case defaultProject != "":
+			return true, fmt.Errorf(
+				"configured defaultProject %q doesn't match a runnable project here — run `rig run <project>` or update the default",
+				defaultProject)
+		default:
+			return true, fmt.Errorf(
+				"no single run target here — this is a workspace root with %s and %s; run `rig run <project>` or `rig <script>`",
+				pluralN(len(tasks), "package"), pluralN(len(scripts), "script"))
+		}
+	}
+	switch sel := pickRunTarget(cdContext(cmd), root, scripts); {
+	case sel.cancel:
+		return true, nil
+	case sel.script != nil:
+		return true, sel.script.run(cmd, nil)
+	case sel.task != nil:
+		return true, runCommand(cmd, sel.task.dir, sel.task.argv)
+	default:
+		return true, nil
+	}
+}
+
+// preferredRunTasks finds the runnable tasks a configured defaultProject names,
+// scored through nameTier and narrowed by proximity to cwd — the identical
+// pipeline `rig run <name>` puts an argument through, so a config value and a
+// typed name always mean the same project.
+//
+// It returns every remaining match rather than the first: when a default names
+// two checkouts of the same project the caller must say so, not pick whichever
+// one discovery reached first. Empty when no default is set or it names no
+// runnable task — callers then fall back to the picker.
+func preferredRunTasks(tasks []allTask, defaultProject string) []allTask {
+	q := strings.TrimSpace(defaultProject)
+	if q == "" {
+		return nil
+	}
+	best := 0
+	var hits []allTask
+	for _, t := range tasks {
+		switch tier := nameTier(t.name, q); {
+		case tier < minMatchTier:
+		case tier > best:
+			best, hits = tier, []allTask{t}
+		case tier == best:
+			hits = append(hits, t)
+		}
+	}
+	cwd, _ := os.Getwd()
+	return nearestByDir(cwd, hits, func(t allTask) string { return t.dir })
+}
+
+// noteResolvedDefault prints which project a bare `rig run` resolved through
+// defaultProject, and where it lives. Without it the launch is indistinguishable
+// from any other — same name, same output — even when the copy that started is
+// one you forgot existed. Suppressed by --quiet, like the command echo.
+func noteResolvedDefault(cmd *cobra.Command, defaultProject string, t allTask) {
+	if quiet {
+		return
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), dimStyle.Render(
+		fmt.Sprintf("· defaultProject %s → %s", defaultProject, taskPath(t))))
+}
+
+// dotShortName is the segment after the last '.' (a .NET project's short name).
+func dotShortName(name string) string {
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return name[i+1:]
+	}
+	return name
+}
+
+// isRunnable reports whether a workspace target can actually be run — it filters
+// the `run` picker so libraries don't appear. Precise for Go (looks for a
+// `package main`); other ecosystems pass through (their `run` mapping is the
+// gate).
+func isRunnable(t target) bool {
+	switch t.Eco {
+	case detect.Go:
+		return goDirHasMain(t.Dir)
+	case detect.DotNet:
+		// Discovery classified it from the csproj <OutputType> (Exe/WinExe and
+		// not a test project) — libraries and test projects aren't run targets.
+		return t.Runnable
+	}
+	return true
+}
+
+// goDirHasMain reports whether dir has a buildable `package main` — a non-test
+// *.go file at the dir root whose package clause is `main`. Best-effort.
+func goDirHasMain(dir string) bool {
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+	for _, f := range matches {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		if fileDeclaresMainPackage(f) {
+			return true
+		}
+	}
+	return false
+}
+
+// fileDeclaresMainPackage reports whether a .go file's package clause is `main`.
+// The first non-blank, non-comment line of a Go file is its `package` clause, so
+// scanning to it is enough. Best-effort (line comments / build tags skipped).
+func fileDeclaresMainPackage(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
+			continue
+		}
+		return line == "package main"
+	}
+	return false
+}
+
+func filterNote(filter string) string {
+	if filter == "" {
+		return ""
+	}
+	return " matching " + filter
+}

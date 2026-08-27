@@ -1,0 +1,922 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-isatty"
+	"github.com/rigsmith/rigsmith/core/climenu"
+	"github.com/rigsmith/rigsmith/core/devroute"
+	"github.com/rigsmith/rigsmith/core/gitrepo"
+	"github.com/rigsmith/rigsmith/core/match"
+	"github.com/rigsmith/rigsmith/core/worktree"
+	"github.com/rigsmith/rigsmith/internal/rig/config"
+	"github.com/rigsmith/rigsmith/internal/rig/detect"
+	"github.com/spf13/cobra"
+)
+
+// newWorktreeCmd builds the `worktree` command group — rig's parallel-dev loop.
+// A worktree is a *sibling* checkout (at <repo>-worktrees/<branch>) you build and
+// run independently with the -dev/-wt launchers; `use` pins one as the active
+// route so a bare `rig-dev` builds from it. Opened in its own VS Code window,
+// this session's cwd (and its chat history) never moves — which is exactly what
+// clauderig's EnterWorktree guard enforces.
+func newWorktreeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "worktree",
+		Aliases: []string{"wt"},
+		Short:   "Parallel worktrees — sibling checkouts for working on branches side by side",
+		Long: "Sibling checkouts at <repo>-worktrees/<branch>, each built and run on its\n" +
+			"own so you can work several branches at once. Opened in their own window,\n" +
+			"this checkout (and its shell + chat history) never moves.\n\n" +
+			"  rig wt new feat/x     create a worktree (and branch) at a sibling path\n" +
+			"  rig wt list           list this repo's worktrees\n" +
+			"  rig wt cd [query]     cd into a worktree (needs the rig shell wrapper)\n" +
+			"  rig wt open <branch>  open a worktree in a new window (review/diff)\n" +
+			"  rig wt rm <branch>    remove a worktree (its branch is kept)\n\n" +
+			"Sweep merged worktrees with `rig prune`.",
+		// Bare `rig worktree` on a TTY opens the lifecycle menu — the same actions as
+		// the `rig ui` Worktrees group; with a verb or off a TTY the subcommands stand
+		// (and `worktree -h` still prints help). The menu is explicit (RunMenu), not
+		// climenu.Run's subcommand introspection, because the useful verbs
+		// (new/open/rm) take a branch arg — the no-arg wrappers prompt for it, so a
+		// bare `climenu.Run` would only ever offer `list`.
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if stdinStdoutTTY() {
+				return climenu.RunMenu(cmd, cmd.CommandPath(), cmd.Short, worktreeMenuEntries())
+			}
+			return cmd.Help()
+		},
+	}
+	cmd.AddCommand(newWorktreeNewCmd(), newWorktreeListCmd(), newWorktreeCdCmd(), newWorktreeOpenCmd(), newWorktreeRemoveCmd(), newWorktreePickCmd(), newWorktreeMenuCmd(), newWorktreeUseCmd(), newWorktreeActiveCmd(), newWorktreeUnsetCmd())
+	return cmd
+}
+
+// worktreeMenuEntries adapts the worktree lifecycle items (shared with the
+// `rig ui` Worktrees group) into climenu entries, so bare `rig wt` on a TTY
+// shows the same menu. Unlike climenu.Run's subcommand introspection, these
+// surface the arg-taking verbs (new/open/rm) via their no-arg prompting
+// wrappers — so the menu isn't reduced to just `list`.
+func worktreeMenuEntries() []climenu.Entry {
+	items := worktreeMenuItems()
+	entries := make([]climenu.Entry, 0, len(items))
+	for _, it := range items {
+		entries = append(entries, climenu.Entry{Label: it.label, Desc: it.desc, Cmd: it.cmd})
+	}
+	return entries
+}
+
+// worktreesFor opens the repo to act on (the --repo flag, or the current
+// directory) and returns its worktree list plus the path to key the dev route
+// on. That key is the --repo value verbatim when given — the `<tool>-wt`
+// launchers pass the same {{REPO}} the `-dev` wrapper bakes its route-file path
+// from, so writes here land where reads look. With no --repo it's the main
+// worktree (wts[0]), so `worktree use` keys consistently whether run from the
+// primary checkout or a linked one.
+func worktreesFor(ctx context.Context, repoDir string) (routeKey string, wts []gitrepo.Worktree, err error) {
+	dir := repoDir
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", nil, err
+		}
+		dir = cwd
+	}
+	repo, err := gitrepo.Open(ctx, dir)
+	if err != nil {
+		return "", nil, fmt.Errorf("not inside a git repository")
+	}
+	wts, err = repo.WorktreeList(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(wts) == 0 {
+		return "", nil, fmt.Errorf("no worktrees found")
+	}
+	routeKey = repoDir
+	if routeKey == "" {
+		routeKey = wts[0].Path // git lists the main worktree first
+	}
+	return routeKey, wts, nil
+}
+
+// branchAt names the branch of the worktree at path for display, falling back to
+// the directory's base name when path isn't one of this repo's worktrees (e.g. a
+// bare directory passed as a query).
+func branchAt(wts []gitrepo.Worktree, path string) string {
+	for _, wt := range wts {
+		if sameDir(wt.Path, path) {
+			if wt.Branch != "" {
+				return wt.Branch
+			}
+			return "(detached)"
+		}
+	}
+	return filepath.Base(path)
+}
+
+// newWorktreePickCmd resolves a worktree and prints its path to stdout. It
+// powers the `<tool>-wt` dev launchers: the huh UI (when needed) draws on stderr
+// so stdout carries only the path the launcher captures. --repo lets a launcher
+// invoked from another repo still resolve *this* repo's worktrees.
+//
+// With a [query] it's the best fuzzy match (exact > prefix > substring >
+// subsequence), or a directory path used as-is. With no query it auto-selects
+// the lone linked worktree, falls back to the main checkout when there are no
+// linked worktrees, or shows an interactive picker when several exist.
+func newWorktreePickCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:               "pick [query]",
+		Short:             "Resolve or select a worktree and print its path (used by <tool>-wt)",
+		Args:              cobra.MaximumNArgs(1),
+		Hidden:            true,
+		ValidArgsFunction: worktreeCompletion(cobra.ShellCompDirectiveNoFileComp),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, wts, err := worktreesFor(cmd.Context(), repoDir)
+			if err != nil {
+				return err
+			}
+			query := ""
+			if len(args) == 1 {
+				query = strings.TrimSpace(args[0])
+			}
+			chosen, err := resolveWorktree(wts, query)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), chosen)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo directory whose worktrees to resolve (default: current directory)")
+	return cmd
+}
+
+// newWorktreeUseCmd pins a worktree as this repo's active dev route, so a bare
+// `<tool>-dev` builds from it. It's the persistent counterpart to a transient
+// `<tool>-wt [query]`; the `<tool>-wt --use` sugar calls it. Selection reuses
+// resolveWorktree (auto-select the lone worktree, else the huh picker), and the
+// pin is written via core/devroute — the same file the `-dev` wrappers read.
+func newWorktreeUseCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:    "use [query]",
+		Hidden: true, // -dev route plumbing: kept for the *-wt launchers, off the shipped surface
+		Short:  "Pin a worktree as the active route for the -dev launchers",
+		Long: `Pin a worktree so a bare <tool>-dev builds from it without repeating the
+selection. With [query] it's the best fuzzy match; with no query it auto-selects
+the lone worktree or shows a picker. Clear it with ` + "`worktree unset`" + `. An
+explicit RIGSMITH_DEV_SRC env var (or a one-off <tool>-wt [query]) still wins.`,
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: worktreeCompletion(cobra.ShellCompDirectiveNoFileComp),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			routeKey, wts, err := worktreesFor(cmd.Context(), repoDir)
+			if err != nil {
+				return err
+			}
+			query := ""
+			if len(args) == 1 {
+				query = strings.TrimSpace(args[0])
+			}
+			chosen, err := resolveWorktree(wts, query)
+			if err != nil {
+				return err
+			}
+			if err := devroute.Write(routeKey, chosen); err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "%s pinned -dev route → %s\n", OkStyle.Render("✓"), HeaderStyle.Render(branchAt(wts, chosen)))
+			fmt.Fprintf(out, "  %s\n", DimStyle.Render(chosen))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo directory whose route to set (default: current directory)")
+	return cmd
+}
+
+// newWorktreeActiveCmd prints the pinned dev route, or a note that none is set.
+// A pin whose directory has since vanished is flagged — the `-dev` wrappers fall
+// back to the repo in that case.
+func newWorktreeActiveCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:     "active",
+		Aliases: []string{"route"},
+		Hidden:  true, // -dev route plumbing, off the shipped surface
+		Short:   "Show the pinned -dev route, if any",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			routeKey, wts, err := worktreesFor(cmd.Context(), repoDir)
+			if err != nil {
+				return err
+			}
+			pinned, err := devroute.Read(routeKey)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if pinned == "" {
+				fmt.Fprintln(out, DimStyle.Render("no pinned route — -dev builds from the repo"))
+				return nil
+			}
+			stale := ""
+			if _, err := os.Stat(pinned); err != nil {
+				stale = WarnStyle.Render("  (missing — -dev falls back to the repo)")
+			}
+			fmt.Fprintf(out, "%s  %s%s\n", HeaderStyle.Render(branchAt(wts, pinned)), DimStyle.Render(pinned), stale)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo directory whose route to show (default: current directory)")
+	return cmd
+}
+
+// newWorktreeUnsetCmd clears the pinned dev route, so `<tool>-dev` builds from
+// the repo again. Clearing when nothing is pinned is a harmless no-op.
+func newWorktreeUnsetCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:     "unset",
+		Aliases: []string{"clear", "off"},
+		Hidden:  true, // -dev route plumbing, off the shipped surface
+		Short:   "Clear the pinned -dev route (build from the repo again)",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			routeKey, _, err := worktreesFor(cmd.Context(), repoDir)
+			if err != nil {
+				return err
+			}
+			pinned, _ := devroute.Read(routeKey)
+			if err := devroute.Unset(routeKey); err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if pinned == "" {
+				fmt.Fprintln(out, DimStyle.Render("no route was pinned"))
+				return nil
+			}
+			fmt.Fprintf(out, "%s cleared the pinned -dev route\n", OkStyle.Render("✓"))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo directory whose route to clear (default: current directory)")
+	return cmd
+}
+
+// resolveWorktree maps a query (or its absence) to a worktree path. git lists
+// the main worktree first, so wts[0] is the main checkout and wts[1:] are the
+// linked ones.
+func resolveWorktree(wts []gitrepo.Worktree, query string) (string, error) {
+	if query == "" {
+		linked := wts[1:]
+		switch len(linked) {
+		case 0:
+			return wts[0].Path, nil // no linked worktrees → main (same as -dev)
+		case 1:
+			return linked[0].Path, nil // exactly one → auto-select
+		default:
+			return pickWorktree(wts)
+		}
+	}
+	// A directory path wins outright — lets you point at any checkout.
+	if fi, err := os.Stat(query); err == nil && fi.IsDir() {
+		return filepath.Abs(query)
+	}
+	ranked := rankWorktrees(wts, query)
+	if len(ranked) == 0 {
+		return "", fmt.Errorf("no worktree matching %q", query)
+	}
+	return ranked[0].Path, nil
+}
+
+// rankWorktrees returns the worktrees matching query, best first — branch name
+// (and its short name) beat the path basename, exact > prefix > substring >
+// subsequence. No depth preference; ties go to the shortest (closest) branch
+// name. Pure; shared by resolveWorktree and `wt cd`.
+func rankWorktrees(wts []gitrepo.Worktree, query string) []gitrepo.Worktree {
+	return match.Rank(wts, query, func(w gitrepo.Worktree) match.Fields {
+		return match.Fields{
+			Name: []string{w.Branch, match.ShortName(w.Branch)},
+			Path: []string{filepath.Base(w.Path)},
+			Tie:  len(w.Branch),
+		}
+	})
+}
+
+// worktreeCompletion builds a Cobra ValidArgsFunction that completes the first
+// positional arg with this repo's worktree branch names, each described by its
+// path. It's what makes `open`/`rm`/`pick` a single <Tab> away from picking an
+// existing checkout. dir is the directive returned alongside the names: pass
+// ShellCompDirectiveNoFileComp for a branch-only arg (rm/pick), or
+// ShellCompDirectiveFilterDirs for one that also accepts a path (open), so
+// directory completion still works. Any failure (not in a repo, no worktrees)
+// degrades to "no completions" rather than erroring — completion must never get
+// in the user's way.
+func worktreeCompletion(dir cobra.ShellCompDirective) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(cmd *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		// Complete against the SAME repository the command would act on. Reading
+		// the cwd here instead would offer branches from one repo while the verb
+		// operated on another — `rig worktree open --repo /other <TAB>` would
+		// suggest names that do not exist there, and offer nothing at all when
+		// the cwd is not a repository.
+		repoDir, _ := cmd.Flags().GetString("repo")
+		repo, _, err := openRepoAt(cmd.Context(), repoDir)
+		if err != nil {
+			return nil, dir
+		}
+		wts, err := repo.WorktreeList(cmd.Context())
+		if err != nil {
+			return nil, dir
+		}
+		return worktreeCompletions(wts), dir
+	}
+}
+
+// worktreeCompletions turns a worktree list into Cobra completion candidates in
+// "value\tdescription" form — the branch name (and its short name, when it
+// differs) keyed to the worktree's path. Those are the same two name forms
+// resolveWorktree ranks against, so anything that completes also resolves.
+// Detached worktrees (empty branch) contribute nothing. Pure, so it's unit
+// tested directly.
+func worktreeCompletions(wts []gitrepo.Worktree) []string {
+	seen := map[string]bool{}
+	var comps []string
+	add := func(name, path string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		comps = append(comps, name+"\t"+path)
+	}
+	for _, wt := range wts {
+		add(wt.Branch, wt.Path)
+		add(match.ShortName(wt.Branch), wt.Path)
+	}
+	return comps
+}
+
+// pickWorktree shows the filterable huh worktree picker and returns the chosen
+// path. Requires a TTY on stderr (stdout carries the result).
+func pickWorktree(wts []gitrepo.Worktree) (string, error) {
+	return pickWorktreeTitled(wts, "Run from which worktree?")
+}
+
+// pickWorktreeTitled is pickWorktree with a caller-supplied prompt, so `wt cd`
+// can ask "cd to which worktree?" while the `<tool>-wt` launchers ask which to
+// run. Requires a TTY on stderr (stdout carries the result).
+func pickWorktreeTitled(wts []gitrepo.Worktree, title string) (string, error) {
+	if !pickerTTY() {
+		return "", fmt.Errorf("multiple worktrees and no terminal for the picker; pass a branch or path")
+	}
+	now := time.Now()
+	recent := worktreesByRecent(wts)
+	// Build plain, column-aligned labels and let the huh theme color them. Pre-
+	// styling the label with our own ANSI (HeaderStyle/DimStyle) breaks huh's
+	// selected-row highlight: its green foreground only survives up to the first
+	// embedded reset, so just the first character stays green.
+	branches := make([]string, len(recent))
+	ages := make([]string, len(recent))
+	branchW, ageW := 0, 0
+	for i, wt := range recent {
+		branches[i] = wt.Branch
+		if branches[i] == "" {
+			branches[i] = "(detached)"
+		}
+		if w := lipgloss.Width(branches[i]); w > branchW {
+			branchW = w
+		}
+		ages[i] = humanizeAgo(wt.ModTime, now)
+		if w := lipgloss.Width(ages[i]); w > ageW {
+			ageW = w
+		}
+	}
+	opts := make([]huh.Option[string], 0, len(recent))
+	for i, wt := range recent {
+		label := pickColumns(branches[i], ages[i], wt.Path, branchW, ageW)
+		opts = append(opts, huh.NewOption(label, wt.Path))
+	}
+	var chosen string
+	err := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title(title).Options(opts...).Filtering(true).Value(&chosen),
+	)).WithTheme(rigTheme()).Run()
+	if err != nil {
+		return "", err
+	}
+	return chosen, nil
+}
+
+// pickerTTY reports whether we can show the worktree picker. Unlike the shared
+// interactive(), it checks stderr (where huh draws) rather than stdout, because
+// callers capture stdout for the chosen path.
+func pickerTTY() bool {
+	return isatty.IsTerminal(os.Stderr.Fd()) && isatty.IsTerminal(os.Stdin.Fd())
+}
+
+// openRepo opens the git repo containing the current directory.
+func openRepo(ctx context.Context) (*gitrepo.Repo, string, error) {
+	return openRepoAt(ctx, "")
+}
+
+// openRepoAt opens the git repo containing dir — the --repo flag's value — or
+// the current directory when dir is empty. Acting on another repo by path is
+// the sanctioned alternative to cd'ing there (which would move this session's
+// working directory), so every visible worktree verb routes through this.
+func openRepoAt(ctx context.Context, dir string) (*gitrepo.Repo, string, error) {
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, "", err
+		}
+		repo, err := gitrepo.Open(ctx, cwd)
+		if err != nil {
+			return nil, "", fmt.Errorf("not inside a git repository")
+		}
+		root, err := repo.Toplevel(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return repo, root, nil
+	}
+	repo, err := gitrepo.Open(ctx, dir)
+	if err != nil {
+		return nil, "", fmt.Errorf("not a git repository: %s", dir)
+	}
+	root, err := repo.Toplevel(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return repo, root, nil
+}
+
+func newWorktreeNewCmd() *cobra.Command {
+	var base, repoDir string
+	var open, noOpen bool
+	cmd := &cobra.Command{
+		Use:   "new <branch>",
+		Short: "Create a worktree (and branch) at a sibling path",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			branch := args[0]
+			repo, root, err := openRepoAt(ctx, repoDir)
+			if err != nil {
+				return err
+			}
+			path := worktree.PathFor(root, branch)
+			if _, err := os.Stat(path); err == nil {
+				return fmt.Errorf("worktree path already exists: %s", path)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			create := !repo.BranchExists(ctx, branch)
+			if base == "" {
+				base = repo.DefaultBranch(ctx)
+			}
+			if err := repo.WorktreeAdd(ctx, path, branch, base, create); err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			verb := "checked out"
+			if create {
+				verb = fmt.Sprintf("created off %s", base)
+			}
+			fmt.Fprintf(out, "%s worktree for %s (%s)\n", OkStyle.Render("✓"), HeaderStyle.Render(branch), verb)
+			fmt.Fprintf(out, "  %s\n", path)
+			// Auto-open is opt-in: off by default, enabled via the worktree.autoOpen
+			// config. The --open/--no-open flags override that per run. When we skip,
+			// openReview still prints the review hint.
+			openWindow := false
+			if cfg, err := config.LoadMerged(root); err == nil {
+				openWindow = cfg.WorktreeAutoOpen()
+			}
+			if cmd.Flags().Changed("open") {
+				openWindow = open
+			}
+			if noOpen {
+				openWindow = false
+			}
+			openReview(cmd, path, !openWindow)
+			fmt.Fprintln(out, DimStyle.Render("  This window stays put. Edit there by absolute path; run git via:"))
+			fmt.Fprintf(out, "  %s\n", DimStyle.Render("git -C "+path+" add/commit/push  →  then open a PR"))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&base, "base", "", "branch to fork from (default: repo's mainline)")
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo to create the worktree for (default: current directory)")
+	cmd.Flags().BoolVar(&open, "open", false, "open the worktree in a new VS Code window for review")
+	cmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open a window even if worktree.autoOpen is set")
+	cmd.MarkFlagsMutuallyExclusive("open", "no-open")
+	return cmd
+}
+
+func newWorktreeListCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "List this repo's worktrees",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			repo, _, err := openRepoAt(ctx, repoDir)
+			if err != nil {
+				return err
+			}
+			wts, err := repo.WorktreeList(ctx)
+			if err != nil {
+				return err
+			}
+			// Newest first, and pad the branch + age into columns so the dim path
+			// column lines up. The branch wears rig's blue accent like the menu.
+			wts = worktreesByRecent(wts)
+			now := time.Now()
+			branches := make([]string, len(wts))
+			ages := make([]string, len(wts))
+			width, ageWidth := 0, 0
+			for i, wt := range wts {
+				branches[i] = wt.Branch
+				if branches[i] == "" {
+					branches[i] = "(detached)"
+				}
+				if w := lipgloss.Width(branches[i]); w > width {
+					width = w
+				}
+				ages[i] = humanizeAgo(wt.ModTime, now)
+				if w := lipgloss.Width(ages[i]); w > ageWidth {
+					ageWidth = w
+				}
+			}
+			out := cmd.OutOrStdout()
+			for i, wt := range wts {
+				pad := strings.Repeat(" ", width-lipgloss.Width(branches[i]))
+				age := ""
+				if ageWidth > 0 {
+					age = DimStyle.Render(fmt.Sprintf("%*s", ageWidth, ages[i])) + "  "
+				}
+				fmt.Fprintf(out, "%s%s  %s%s\n", wtBranchStyle.Render(branches[i]), pad, age, DimStyle.Render(wt.Path))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo whose worktrees to list (default: current directory)")
+	return cmd
+}
+
+func newWorktreeOpenCmd() *cobra.Command {
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:               "open <branch|path>",
+		Short:             "Open a worktree in a new VS Code window (for review/diff)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: worktreeCompletion(cobra.ShellCompDirectiveFilterDirs),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			_, root, err := openRepoAt(ctx, repoDir)
+			if err != nil {
+				return err
+			}
+			path := args[0]
+			if _, err := os.Stat(path); err != nil {
+				path = worktree.PathFor(root, args[0])
+			}
+			if _, err := os.Stat(path); err != nil {
+				return fmt.Errorf("no such worktree: %s", path)
+			}
+			openReview(cmd, path, false)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo whose worktree to open (default: current directory)")
+	return cmd
+}
+
+func newWorktreeRemoveCmd() *cobra.Command {
+	var force bool
+	var repoDir string
+	cmd := &cobra.Command{
+		Use:               "rm <branch>",
+		Aliases:           []string{"remove"},
+		Short:             "Remove a worktree (its branch is kept)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: worktreeCompletion(cobra.ShellCompDirectiveNoFileComp),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			repo, root, err := openRepoAt(ctx, repoDir)
+			if err != nil {
+				return err
+			}
+			path := worktree.PathFor(root, args[0])
+			if err := repo.WorktreeRemove(ctx, path, force); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s removed %s\n", OkStyle.Render("✓"), path)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "remove even if the worktree has changes")
+	cmd.Flags().StringVar(&repoDir, "repo", "", "repo whose worktree to remove (default: current directory)")
+	return cmd
+}
+
+// The worktree menu can't run the arg-taking new/open/rm directly, so these
+// no-arg wrappers drive the interactive step (a branch-name prompt, or the
+// picker) and then do the work. Hidden — they exist only for the menu.
+
+func newWorktreeNewMenuCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "new",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var branch string
+			if err := huh.NewForm(huh.NewGroup(
+				huh.NewInput().Title("New worktree").
+					Description("Branch name (created off mainline if it doesn't exist)").
+					Value(&branch),
+			)).WithKeyMap(huhEscKeyMap()).WithTheme(rigTheme()).Run(); err != nil {
+				return nil // cancelled
+			}
+			if branch = strings.TrimSpace(branch); branch == "" {
+				return nil
+			}
+			sub := newWorktreeNewCmd()
+			sub.SetContext(cmd.Context())
+			sub.SetOut(cmd.OutOrStdout())
+			sub.SetErr(cmd.ErrOrStderr())
+			return sub.RunE(sub, []string{branch})
+		},
+	}
+}
+
+func newWorktreeOpenMenuCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "open",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if path := pickWorktreeForMenu(cmd); path != "" {
+				openReview(cmd, path, false)
+			}
+			return nil
+		},
+	}
+}
+
+func newWorktreeRemoveMenuCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "rm",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			path := pickWorktreeForMenu(cmd)
+			if path == "" {
+				return nil
+			}
+			repo, _, err := openRepo(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if err := repo.WorktreeRemove(cmd.Context(), path, false); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s removed %s\n", OkStyle.Render("✓"), path)
+			return nil
+		},
+	}
+}
+
+// pickWorktreeForMenu chooses one of this repo's *linked* worktrees for a menu
+// action — auto-selecting a lone one. Returns "" (with a note) when there are
+// none, or "" when the picker is cancelled, so the caller just does nothing.
+func pickWorktreeForMenu(cmd *cobra.Command) string {
+	_, wts, err := worktreesFor(cmd.Context(), "")
+	if err != nil || len(wts) <= 1 {
+		fmt.Fprintln(cmd.OutOrStdout(), DimStyle.Render("no linked worktrees"))
+		return ""
+	}
+	linked := wts[1:] // git lists the main checkout first; never act on it
+	if len(linked) == 1 {
+		return linked[0].Path
+	}
+	chosen, err := pickWorktree(linked)
+	if err != nil {
+		return "" // cancelled / no TTY
+	}
+	return chosen
+}
+
+// pruneWorktrees removes the repo's linked worktrees that are clean and either
+// merged into base or (with gone) whose branch's upstream the remote deleted. It
+// prints one line per worktree and returns the removed/kept counts, freed — the
+// branch names whose worktrees were removed (or, in dry-run, would be), which the
+// combined sweep uses so the branch phase no longer treats them as attached — and
+// the rows it rendered (so the confirm screen can offer to force kept ones).
+// The caller prints the summary line. root is this session's worktree, which —
+// like the primary checkout and the base — is never touched.
+//
+// only (when non-nil) restricts the sweep to worktrees whose branch is named in
+// it; force names worktrees to remove despite a soft skip reason (not merged,
+// dirty, even-with-base, …) — the hard rails (current/base/primary) still hold.
+func pruneWorktrees(ctx context.Context, out io.Writer, repo *gitrepo.Repo, root, base string, dryRun, gone, deleteBranches bool, only, force map[string]bool) (removed, kept int, freed []string, rows []pruneRow, err error) {
+	wts, err := repo.WorktreeList(ctx)
+	if err != nil {
+		return 0, 0, nil, nil, err
+	}
+	// Clear stale records for worktree dirs removed by hand, so the list we act
+	// on reflects reality. Harmless on existing checkouts.
+	if !dryRun {
+		_ = repo.WorktreePruneMeta(ctx)
+	}
+	goneSet := map[string]bool{}
+	if brs, err := repo.LocalBranches(ctx); err == nil {
+		for _, b := range brs {
+			if b.Gone {
+				goneSet[b.Name] = true
+			}
+		}
+	}
+	// baseSHA lets us spot a branch that's even with base — created but never
+	// committed to. Such a branch is trivially "merged" (an ancestor of base), so
+	// without this guard a brand-new worktree gets reaped before any work lands.
+	baseSHA, _ := repo.RevParse(ctx, base)
+	// The primary checkout is git's first-listed worktree; it's never prunable
+	// even when this session runs from a linked worktree (root) on some other
+	// branch, so guard it by path rather than relying on root or the base name.
+	primary := ""
+	if len(wts) > 0 {
+		primary = wts[0].Path
+	}
+	// skip records a kept worktree; forceable marks ones the user could override
+	// (the confirm screen's [f]) — a hard rail is never forceable.
+	skip := func(label, reason string, forceable bool) {
+		kept++
+		rows = append(rows, pruneRow{name: label, kind: pruneSkip, state: "skip", why: reason, forceable: forceable})
+	}
+	for _, wt := range wts {
+		rail := sameDir(wt.Path, root) || sameDir(wt.Path, primary) || wt.Branch == base
+		if wt.Branch == "" {
+			// Detached worktrees have no branch name to target or delete; only
+			// surface them in a full (unfiltered) sweep.
+			if only == nil {
+				skip("(detached)", "detached HEAD", false)
+			}
+			continue
+		}
+		if only != nil && !only[wt.Branch] {
+			continue // not one of the named targets
+		}
+		if rail {
+			// Naming the current, base, or primary checkout is a mistake worth
+			// showing; in a full sweep it's silently left out as before.
+			if only != nil {
+				skip(wt.Branch, "current, base, or primary checkout — can't prune", false)
+			}
+			continue
+		}
+		label := wt.Branch
+		forced := force[wt.Branch]
+
+		// decide classifies the worktree: remove now, or skip with a reason and
+		// whether force could override it.
+		remove, reason, forceable := func() (bool, string, bool) {
+			clean, err := repo.WorktreeClean(ctx, wt.Path)
+			if err != nil {
+				return false, "couldn't read status", true
+			}
+			if !clean {
+				return false, "uncommitted changes", true
+			}
+			// A branch whose tip equals base is ambiguous: brand-new (created but
+			// never committed — keep it), or its work fast-forwarded into base (tip
+			// now matches, but it did real work — reap it). The reflog tells them
+			// apart; only the never-advanced case is the brand-new worktree we
+			// protect on its own (the confirm screen is the safety net, not a time
+			// window).
+			ffEqual := baseSHA != "" && wt.Head == baseSHA
+			if ffEqual {
+				advanced, err := repo.BranchAdvanced(ctx, wt.Branch)
+				if err != nil {
+					return false, "couldn't read branch history", true
+				}
+				if !advanced {
+					return false, "even with base — nothing to prune", true
+				}
+			}
+			merged, err := repo.IsMerged(ctx, wt.Branch, base)
+			if err != nil {
+				return false, "couldn't check merge state", true
+			}
+			switch {
+			case ffEqual && merged:
+				return true, "merged (fast-forward)", false
+			case merged:
+				return true, "merged", false
+			case goneSet[wt.Branch] && gone:
+				return true, "upstream gone", false
+			case goneSet[wt.Branch]:
+				return false, "upstream gone — kept (--keep-gone)", true
+			default:
+				return false, "not merged into " + base, true
+			}
+		}()
+		if !remove && forced && forceable {
+			remove, reason = true, reason+" — forced"
+		}
+		if !remove {
+			skip(label, reason, forceable)
+			continue
+		}
+		if dryRun {
+			removed++
+			freed = append(freed, wt.Branch)
+			rows = append(rows, pruneRow{name: label, kind: prunePlan, state: "will remove", why: reason})
+			continue
+		}
+		// Force discards uncommitted changes (git worktree remove --force) for the
+		// items the user explicitly named. git also refuses a plain remove on a
+		// worktree that contains a populated submodule ("working trees containing
+		// submodules cannot be moved or removed"); since we only reach removal for
+		// clean worktrees (dirty ones are skipped as "uncommitted changes" unless
+		// force-named, and then forced is already set), forcing that case clears
+		// git's submodule guard without discarding anything the reflog can't recover.
+		removeForce := forced
+		if !removeForce {
+			if hasSub, subErr := repo.WorktreeHasSubmodules(ctx, wt.Path); subErr == nil && hasSub {
+				removeForce = true
+			}
+		}
+		if err := repo.WorktreeRemove(ctx, wt.Path, removeForce); err != nil {
+			skip(label, "remove failed: "+err.Error(), false)
+			continue
+		}
+		removed++
+		freed = append(freed, wt.Branch)
+		why := reason
+		if deleteBranches {
+			if err := repo.DeleteBranch(ctx, wt.Branch, false); err != nil {
+				why += " · kept branch: " + err.Error()
+			} else {
+				why += " · branch deleted"
+			}
+		}
+		rows = append(rows, pruneRow{name: label, kind: pruneDone, state: "removed", why: why})
+	}
+	renderPruneTable(out, rows)
+	return removed, kept, freed, rows, nil
+}
+
+// sameDir reports whether two paths point at the same directory, resolving both
+// to absolute, symlink-free form first. That matters on macOS, where temp dirs
+// (and /var) live behind /private symlinks, so a raw string compare of a git
+// path against a resolved one would miss.
+func sameDir(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return resolveDir(a) == resolveDir(b)
+}
+
+func resolveDir(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return filepath.Clean(p)
+}
+
+// openReview opens path in a review window using the configured opener (default
+// `code -n`), or prints the command to run when skip is set or the opener isn't
+// on PATH. skip carries the caller's decision (the --no-open flag and, for
+// `new`, the worktree.autoOpen config); the opener choice comes from the config
+// of the checkout being opened — not the cwd, which with --repo can be a
+// different repo entirely.
+func openReview(cmd *cobra.Command, path string, skip bool) {
+	out := cmd.OutOrStdout()
+	openCmd := config.DefaultWorktreeOpenCmd
+	if cfg, err := config.LoadMerged(detect.Root(path)); err == nil {
+		openCmd = cfg.WorktreeOpenCmd()
+	}
+	hint := worktree.QuoteCmd(openCmd, path)
+	if skip || !worktree.OpenerAvailable(openCmd) {
+		fmt.Fprintf(out, "  %s\n", DimStyle.Render("review it: "+hint))
+		return
+	}
+	if err := worktree.Open(cmd.Context(), openCmd, path); err != nil {
+		fmt.Fprintf(out, "  %s\n", WarnStyle.Render("couldn't open a review window; run: "+hint))
+		return
+	}
+	fmt.Fprintf(out, "  %s\n", DimStyle.Render("opened in a new window for review"))
+}

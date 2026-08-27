@@ -1,0 +1,36 @@
+# Go
+/bin/
+/dist/
+# Generated npm binary-wrapper packages (scripts/npm/build-packages.mjs)
+/npm/dist/
+*.test
+*.out
+# Coverage output (reports/profiles), but never the `rig coverage` source.
+coverage.*
+!coverage.go
+!coverage_report.go
+
+# Local archive of pruned planning docs (purged from git history; kept on disk only)
+/docs-archive/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# go.work is checked in for the monorepo; sums are not always needed locally
+go.work.sum
+
+# Build artifacts
+**/__debug_bin*
+# `go build` artifacts when run inside the installer tool dirs
+/scripts/dev-install/dev-install
+/scripts/source-install/source-install
+
+# .NET build output (e.g. the examples/demo dotnet fixture)
+[Bb]in/
+[Oo]bj/
+
+# Generated Windows resource files (icon + version info); emitted by
+# scripts/winres.sh into each cmd/<tool>/ during the goreleaser before hook.
+cmd/*/*.syso

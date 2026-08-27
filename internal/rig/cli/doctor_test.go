@@ -1,0 +1,195 @@
+package cli
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestSdkSatisfies(t *testing.T) {
+	tests := []struct {
+		name      string
+		installed string
+		pinned    string
+		want      bool
+	}{
+		{"no pin", "8.0.100", "", true},
+		{"exact major", "8.0.100", "8.0.100", true},
+		{"newer major ok", "9.0.100", "8.0.400", true},
+		{"older major fails", "7.0.400", "8.0.100", false},
+		{"unparseable installed defers to ok", "preview", "8.0.100", true},
+		{"unparseable pin defers to ok", "8.0.100", "latest", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sdkSatisfies(tt.installed, tt.pinned); got != tt.want {
+				t.Fatalf("sdkSatisfies(%q, %q) = %v, want %v", tt.installed, tt.pinned, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMajorOf(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+		ok   bool
+	}{
+		{"8.0.100", 8, true},
+		{"10", 10, true},
+		{" 9.0 ", 9, true},
+		{"preview", 0, false},
+		{"", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, ok := majorOf(tt.in)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if ok && got != tt.want {
+				t.Fatalf("major = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- ports of the .NET rig's DoctorTests (ReadSdkPin) ----
+
+func TestSdkSatisfies_DefersToSatisfiedWhenAPinIsAbsentOrUnparseable(t *testing.T) {
+	if !sdkSatisfies("9.0.100", "") {
+		t.Fatal("absent pin must defer to satisfied")
+	}
+	if !sdkSatisfies("9.0.100", "   ") {
+		t.Fatal("whitespace pin must defer to satisfied")
+	}
+	if !sdkSatisfies("not-a-version", "9.0.100") {
+		t.Fatal("an unparseable installed version must defer to satisfied")
+	}
+}
+
+func TestReadSdkPin_ReturnsThePinnedVersionOrEmpty(t *testing.T) {
+	pinned := t.TempDir()
+	writeFile(t, filepath.Join(pinned, "global.json"),
+		`{ "sdk": { "version": "9.0.100", "rollForward": "latestMinor" } }`)
+	if got := readSdkPin(pinned); got != "9.0.100" {
+		t.Fatalf("pinned = %q, want 9.0.100", got)
+	}
+
+	// The nearest global.json wins, pin or not: one without sdk.version is no pin.
+	unpinned := t.TempDir()
+	writeFile(t, filepath.Join(unpinned, "global.json"),
+		`{ "test": { "runner": "Microsoft.Testing.Platform" } }`)
+	if got := readSdkPin(unpinned); got != "" {
+		t.Fatalf("unpinned = %q, want empty", got)
+	}
+}
+
+func TestReadSdkPin_FindsAGlobalJsonInAnAncestorDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "global.json"), `{ "sdk": { "version": "8.0.0" } }`)
+	nested := filepath.Join(root, "src", "App")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSdkPin(nested); got != "8.0.0" {
+		t.Fatalf("nested = %q, want 8.0.0", got)
+	}
+}
+
+// writeFile writes content to path, failing the test on error.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeHasDependencies(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) {
+		if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if nodeHasDependencies(dir) {
+		t.Error("no package.json → no dependencies")
+	}
+	write(`{"name":"x"}`)
+	if nodeHasDependencies(dir) {
+		t.Error("package.json without deps → false")
+	}
+	write(`{"dependencies":{"left-pad":"^1"}}`)
+	if !nodeHasDependencies(dir) {
+		t.Error("dependencies present → true")
+	}
+	write(`{"devDependencies":{"vitest":"^2"}}`)
+	if !nodeHasDependencies(dir) {
+		t.Error("devDependencies present → true")
+	}
+}
+
+func TestManifestParsers(t *testing.T) {
+	dir := t.TempDir()
+	must := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+	must("go.mod", "module example.com/x\n\ngo 1.23\n")
+	must("Cargo.toml", "[package]\nname = \"x\"\nversion = \"3.1.4\"\n")
+
+	if got := readTargetFramework(dir); got != "net8.0" {
+		t.Errorf("readTargetFramework = %q, want net8.0", got)
+	}
+	if got := readGoVersion(dir); got != "1.23" {
+		t.Errorf("readGoVersion = %q, want 1.23", got)
+	}
+	if got := readCargoVersion(dir); got != "3.1.4" {
+		t.Errorf("readCargoVersion = %q, want 3.1.4", got)
+	}
+	empty := t.TempDir()
+	if readTargetFramework(empty) != "" || readGoVersion(empty) != "" || readCargoVersion(empty) != "" {
+		t.Error("missing manifests should parse to empty")
+	}
+}
+
+func TestOrderedEcos(t *testing.T) {
+	byEco := map[string][]target{
+		"cargo":  {{}},
+		"go":     {{}},
+		"dotnet": {{}},
+		"zzz":    {{}}, // unknown ecosystem → appended after the canonical ones
+	}
+	got := orderedEcos(byEco)
+	// canonical go, (node absent), dotnet, cargo — then the unknown.
+	if len(got) != 4 || got[0] != "go" || got[1] != "dotnet" || got[2] != "cargo" || got[3] != "zzz" {
+		t.Errorf("orderedEcos = %v", got)
+	}
+}
+
+// Doctor lists .NET projects through the shared dev model, so version-less apps
+// (no <Version>, the usual case) must survive discovery — the release-oriented
+// ecosystem adapter would drop them.
+func TestDotnetTargetsFindsVersionlessProjects(t *testing.T) {
+	root := t.TempDir()
+	// a version-less app csproj (no <Version>, no Directory.Build.props)
+	app := filepath.Join(root, "app")
+	if err := os.MkdirAll(app, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "App.csproj"),
+		[]byte("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// noise that must be skipped
+	for _, d := range []string{"bin", "obj"} {
+		_ = os.MkdirAll(filepath.Join(app, d), 0o755)
+		_ = os.WriteFile(filepath.Join(app, d, "Ghost.csproj"), []byte("<Project/>"), 0o644)
+	}
+	got := dotnetTargets(root, nil)
+	if len(got) != 1 || got[0].Name != "App" {
+		t.Fatalf("dotnetTargets = %+v, want one 'App'", got)
+	}
+}

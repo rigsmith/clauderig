@@ -1,0 +1,219 @@
+# stack: a fused workspace of upstream forks
+
+> Status: **in progress** (proposed 2026-08-25; first slice on `feat/ws` (verb since renamed `stack`) the
+> same day — manifest, engine install, ephemeral proxy, init/pull/send/status/
+> doctor). Direction settled: josh integration style (one fused history, not
+> sibling clones). Adds a `rig stack` verb family: a
+> workspace repo whose children are *prefixes in one real git history*, imported
+> from and synced back to their upstream repos through
+> [josh](https://josh-project.dev)'s reversible filters, driven the way
+> [rust-lang/josh-sync](https://github.com/rust-lang/josh-sync) drives it — an
+> ephemeral localhost `josh-proxy` plus plain git. Reference workspace:
+> `~/Git/terminal-stack` (Porta.Pty + XTerm.NET + Iciclecreek.Avalonia.Terminal).
+
+## The job
+
+The recurring shape: **downstream contributor to a family of related repos.**
+Three forks that only make sense together — a PTY library, a terminal emulator
+core, and the Avalonia control that consumes both as NuGet packages. Two hard
+requirements that every existing tool trades against each other:
+
+1. **Atomic iteration.** One commit may span an API change in the PTY library
+   and the consumer fix in the terminal control. One history, bisectable,
+   with the workspace's own branches and worktrees.
+2. **Clean upstream exits.** Any slice of that work must leave as an ordinary
+   PR from an ordinary fork branch — correct parents, no rewritten-hash
+   archaeology, upstream never knows the workspace exists.
+
+Submodules and manifest tools (vcstool, west, repo…) satisfy 2 by giving up 1.
+git subtree attempts both and fails 2 (`subtree split` drift, garbage hashes).
+git-subrepo gets close but is history surgery in bash with known `git worktree`
+friction. josh's reversible filter algebra is the only engine that delivers
+both by construction — and rust-lang has been running exactly this shape in
+production (Miri, rust-analyzer, stdarch ↔ `rust-lang/rust`) since mid-2026.
+
+## What josh-sync settles (read its `src/josh.rs` — it's short)
+
+The integration surface is **subprocess + URL + git**. No FFI, no library, no
+server anyone administers:
+
+- **The tool owns the engine.** josh-sync pins `JOSH_VERSION` (`r26.07.19`) as
+  a constant and installs it itself:
+  `cargo +stable install --locked --git https://github.com/josh-project/josh
+  --tag <version> --root <app-data-dir> josh-proxy` (crate `josh-proxy` → bin
+  `josh-proxy`; crate `josh-cli` → bin `josh-filter`). Users never install
+  josh; version skew between engine and history can't happen.
+- **Ephemeral proxy.** Spawn
+  `josh-proxy --local <cache-dir> --remote=https://github.com --port=<p>
+  --no-background` with output silenced; poll a TCP connect every 10ms (1s
+  budget); SIGINT and wait on drop. Total lifecycle ~ a process handle.
+- **Filter-in-the-URL.** All history math happens by fetching/pushing plain
+  git against
+  `http://localhost:<p>/<owner>/<repo>.git@<sha><urlencoded-filter>.git`.
+- **Commit the sync cursor.** Last-synced upstream SHA lives in a committed
+  file; a pull whose upstream SHA hasn't moved exits `NothingToPull`.
+  Idempotent, reviewable, bisectable.
+- **Push means a branch on *your fork*.** Extracted commits land on the
+  contributor's fork; the PR happens from there. Upstream is never pushed.
+- **Automate only the boring direction.** Reusable CI workflow crons the pull
+  direction and opens sync PRs; outbound stays a deliberate human act.
+
+Their admitted wart: the pull direction generates merge commits in the
+extracted history. Named here so we choose merge strategy explicitly per child
+rather than inheriting it.
+
+## The model
+
+A stack workspace is **one ordinary git repo**. Each upstream project is a
+prefix (`porta-pty/`, `xterm-net/`, …) whose contents were imported through
+josh's `:prefix=` filter, plus workspace-owned glue at the root: the manifest,
+the ecosystem overlay (`.slnx` + `Directory.Build.targets` for .NET — see
+appendix), CI. Branches, worktrees (`rig worktree` composes for free — they
+are just branches of one repo), stashes, bisect: all normal git.
+
+```jsonc
+// rig.stack.jsonc  (discovery via cfgfind; also embeddable as "ws" in .rig.json)
+{
+  "$schema": "https://rigsmith.dev/schemas/rig-stack.json",
+  "josh": "r26.07.19",              // engine pin; overrides rig's built-in default
+  "repos": {
+    "porta-pty": {
+      "upstream": "github.com/tomlm/Porta.Pty",   // host/owner/name — no scheme, no .git
+      "fork":     "github.com/JohnCampionJr/Porta.Pty",
+      "branch":   "main"
+    },
+    "xterm-net":            { /* … */ },
+    "iciclecreek-terminal": { /* … */ }
+  },
+  // Machine-written pull cursors, committed with each pull's merge commit.
+  // A separate top-level map, not a field per repo: pulls rewrite this one
+  // value through the comment-preserving jsonc editor (which reaches depth ≤2)
+  // while the human-authored entries above stay byte-for-byte untouched.
+  "lastSync": { "porta-pty": "8f3c2ab…" }
+}
+```
+
+### Verbs
+
+| verb | does |
+|---|---|
+| `rig stack init` | scaffold the manifest; for each repo, import upstream history under its prefix (proxy fetch through `:prefix=<child>`, merge, set cursor); scaffold the ecosystem overlay |
+| `rig stack pull [child]` | fetch upstream through the filter; `NothingToPull` if the cursor matches; else merge (strategy per child), update cursor. The CI-cronnable direction |
+| `rig stack send <child> <branch>` | extract workspace commits touching `<child>/` through the reverse filter onto the **fork** as `<branch>`; print the PR URL (`gh` optional). The deliberate direction |
+| `rig stack status` | per child: upstream commits since cursor, local commits touching the prefix not yet sent, cursor SHA |
+| `rig stack doctor` | engine installed + version matches pin, remotes reachable, manifest sane; `--fix` installs/updates josh (cliguard requires `--fix` on any doctor) |
+
+`rig build` / `rig test` at the root need nothing new: the workspace root *is*
+a repo with a `.slnx` — existing ecosystem detection already resolves it.
+
+### Engine management
+
+rig pins a default josh version as a constant (overridable per-workspace via
+the manifest's `josh` key) and installs to
+`~/.local/share/rigsmith/josh/<version>/bin/`. `stack doctor --fix` performs
+install/update; every verb that needs the engine triggers the same path on
+first use.
+
+**Distribution** (the fresh-machine problem): upstream josh ships source and
+Linux Docker images only — no binaries, and no stated Windows support. A
+machine with only the rig binary therefore can't get an engine from upstream.
+So rig's own release pipeline builds the pinned version per platform
+(linux/macos/windows matrix running the josh-sync cargo recipe) and publishes
+the binaries checksummed alongside rig's releases; `doctor --fix` *downloads*
+the prebuilt for GOOS/GOARCH and only falls back to a local
+`cargo install --tag <pin>` when no prebuilt exists (the current first-slice
+behavior, requiring cargo, with an honest it-takes-minutes message). This
+also makes Windows support a CI fact rather than a user-machine gamble:
+until the windows job compiles josh green, `rig stack` on Windows reports
+"engine not available prebuilt — use WSL or install rust", instead of
+implying a toolchain dance that may dead-end.
+
+### Proxy lifecycle (Go)
+
+`os/exec` spawn with the four flags above; random free port (not josh-sync's
+fixed 42042 — two rig invocations must not collide); readiness = TCP poll;
+teardown = SIGINT then wait with timeout, SIGKILL fallback. One proxy per verb
+invocation, never a daemon. `--local` cache under
+`~/.cache/rigsmith/josh/<workspace-hash>/`.
+
+## Wiring into rig (from the codebase survey, 2026-08-25)
+
+- **Verb name `stack` — not `workspace`, not `josh`.** It names the thing (a
+  stack of upstream forks fused into one history — cf. terminal-stack), not
+  the engine (rig's build-not-dotnet rule) and not "workspace", which already
+  means intra-repo package discovery in this package
+  (`internal/rig/cli/workspace.go`, `detect.hasWorkspaceManifest`). Files:
+  `stack.go`, `stackmanifest.go`, `stackjosh.go`, `stack_test.go` — the
+  `workspace*` namespace stays untouched. (`ws` was the working name of the
+  first slice; rejected as bland and workspace-adjacent.)
+- Register `newWsCmd()` via `extraCmds()` in `internal/rig/cli/extras.go` —
+  the documented home for heavier standalone commands.
+- **cliguard compliance** (hard-fail CI in `internal/cliconsistency`): the
+  group gets a `RunE` driving `climenu` (a bare group with children fails the
+  `group-menu` rule); no `--list` flags; reserved shorthands
+  (`-n/-y/-f/-i/-k/-a/-w/-m`) respected; `stack doctor` has `--fix`.
+- Manifest discovery: a `cfgfind.Spec` (the shiprig `releaseConfigSpec`
+  pattern) — probes `rig.stack.jsonc`/`.json` at the workspace root, optionally
+  `RigPath`/`RigKeys` for inline-in-`.rig.json`, loud error on duplicates.
+  Parse `core/jsonc`, write `core/confkit.Writer` with a new
+  `site/public/schemas/rig-stack.json`.
+- Git operations through `core/gitrepo` (`Clone/Fetch/FetchMerge/AheadBehind/
+  Conflicts…`) — it is "a thin shell over system git", which is exactly what
+  the josh pattern wants. Nothing new in core except possibly a
+  `gitrepo.FetchURL`-style helper if fetching from a raw URL (no named remote)
+  isn't covered.
+- Tests: white-box `_test.go` beside the code, prose-named `t.Run` subtests,
+  per-package `mustGit(t, dir, …)` over `t.TempDir()` (the
+  `core/gitrepo` tests are the model). The proxy runner is tested against a
+  fake `josh-proxy` shell script that opens the port; filter round-trip tests
+  are gated behind the real binary's presence (skip when absent).
+- **Relationship to roadmap.md's "worktree hub (own binary)" item:** that hub
+  is a *dashboard* over parallel dev (worktrees, PR status, agent ownership).
+  `stack` is *state and sync* — manifest, import, cursor, send. Different concern;
+  if the hub materializes it reads stack workspaces like any other repo. The
+  hub's open question "where does cross-repo state live" gets an answer here:
+  in the workspace repo, committed.
+
+## Open questions
+
+1. **Auth on `send`.** The proxy fronts `https://github.com`; pushing the
+   fork branch through it means git credentials for `http://localhost:<p>`
+   forwarded by josh (rustc contributors do this with PATs). John's flow is
+   SSH. Two candidate answers, spike decides: (a) credential passthrough with
+   a scoped PAT; (b) reverse-filter locally via `josh-filter`, then plain
+   `git push git@github.com:…` over SSH — no credentials near josh at all.
+   (b) is the better shape if the filter invocation is tractable.
+2. Merge strategy per child on `pull` (merge vs squash vs rebase-ish), given
+   the known merge-noise wart. Default merge, per-child override in manifest?
+3. `stack init` adopting an existing non-fused workspace (like today's
+   terminal-stack sibling-clone layout): re-import and keep the overlay, or
+   not worth the code?
+4. CI template (`stack init --ci github`) in v1 or after the verbs settle?
+
+## Appendix: the MSBuild overlay
+
+Verified working in `~/Git/terminal-stack` (2026-08-25): none of the three
+upstream repos owns a root `Directory.Build.targets`, so a workspace-root one
+reaches every child project via MSBuild's walk-up and swaps the cross-repo
+`PackageReference`s for `ProjectReference`s with **zero upstream-file edits**.
+Ordering matters (conditions read the package refs before `Remove` deletes
+them); conditioning on `AnyHaveMetadataValue('Identity', …)` rewires only
+actual consumers.
+
+```xml
+<Project>
+  <ItemGroup Condition="'$(UseWorkspaceProjects)' != 'false'">
+    <ProjectReference Include="$(MSBuildThisFileDirectory)porta-pty/src/Porta.Pty/Porta.Pty.csproj"
+                      Condition="@(PackageReference->AnyHaveMetadataValue('Identity', 'Porta.Pty'))" />
+    <PackageReference Remove="Porta.Pty" />
+  </ItemGroup>
+</Project>
+```
+
+Checked with `dotnet msbuild -getItem:ProjectReference,PackageReference`:
+default evaluation swaps `Porta.Pty`/`XTerm.NET` for project refs;
+`-p:UseWorkspaceProjects=false` restores the against-real-packages build that
+upstream CI sees. The walk-up ignores git boundaries, so building a child from
+inside its folder also gets the overlay — right for the dev loop; use the flag
+for pristine verification. Node/Go equivalents (workspaces/overrides,
+`go.work`) slot into the same "overlay scaffolded by `stack init`" position.
