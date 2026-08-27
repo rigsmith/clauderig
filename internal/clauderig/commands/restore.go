@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"github.com/rigsmith/rigsmith/core/brand"
 	"github.com/rigsmith/rigsmith/core/gitrepo"
 	"github.com/rigsmith/rigsmith/core/pathmap"
+	"github.com/rigsmith/rigsmith/internal/clauderig/account"
 	"github.com/rigsmith/rigsmith/internal/clauderig/config"
 	"github.com/rigsmith/rigsmith/internal/clauderig/engine"
 	"github.com/rigsmith/rigsmith/internal/clauderig/manifest"
@@ -105,12 +107,15 @@ func NewRestoreCmd() *cobra.Command {
 			}
 			if backup {
 				bak := cliTarget + ".bak"
-				if _, err := os.Stat(bak); err == nil {
-					return fmt.Errorf("backup %s already exists; move it away first", bak)
+				if err := backupPathIsFree(bak); err != nil {
+					return err
 				}
 				fmt.Fprintf(out, "  backing up %s → %s\n", cliTarget, bak)
 				if err := copyTree(cliTarget, bak); err != nil {
 					return fmt.Errorf("backup: %w", err)
+				}
+				if err := backupIdentityFile(out); err != nil {
+					return err
 				}
 			}
 
@@ -233,6 +238,13 @@ func chooseRestoreSafety(target string) string {
 }
 
 // copyTree recursively copies src to dst (used for the pre-restore backup).
+//
+// Symlinks are recreated, never followed. ~/.claude is full of shared-memory
+// links (worktree slugs pointing memory/ at their main project), and copying
+// through one either duplicates the whole linked tree into the backup or fails
+// outright when it points at a directory. Link text is reproduced verbatim, so
+// an absolute link still resolves to the same place from inside the .bak — the
+// same thing `cp -R` does.
 func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -240,11 +252,83 @@ func copyTree(src, dst string) error {
 		}
 		rel, _ := filepath.Rel(src, p)
 		target := filepath.Join(dst, rel)
+		if d.Type()&fs.ModeSymlink != 0 {
+			return copyLink(p, target)
+		}
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
 		return copyOne(p, target)
 	})
+}
+
+// copyLink recreates the symlink at src as an identical symlink at dst.
+func copyLink(src, dst string) error {
+	link, err := os.Readlink(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(link, dst)
+}
+
+// backupIdentityFile copies ~/.claude.json alongside the tree backup.
+//
+// It holds the oauthAccount block — the ONLY record of which account this
+// machine is logged in as — and it sits outside ~/.claude, so the tree copy
+// above misses it entirely. That is the one file a bad account switch can ruin
+// and nothing else can reconstruct. It can also carry MCP server credentials
+// (mcpServers.*.headers / .env are free-form passthrough), which is exactly why
+// this stays a local .bak and is never what gets synced: the repo records only
+// the three identity fields, via devices.Account.
+//
+// An absent file is not an error — a machine that has never logged in has
+// nothing to protect.
+func backupIdentityFile(out io.Writer) error {
+	src, err := account.GlobalConfigPath()
+	if err != nil {
+		return nil // no home dir: nothing addressable to back up
+	}
+	if _, err := os.Stat(src); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // never logged in here: nothing to protect
+		}
+		// Anything else — unreadable, an I/O error — is not "no identity file".
+		// Skipping silently would drop the one file this backup exists for, at
+		// the moment its state is least certain.
+		return fmt.Errorf("backup identity: %w", err)
+	}
+	dst := src + ".bak"
+	if err := backupPathIsFree(dst); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "  backing up %s → %s\n", src, dst)
+	if err := copyOne(src, dst); err != nil {
+		return fmt.Errorf("backup identity: %w", err)
+	}
+	return nil
+}
+
+// backupPathIsFree reports that nothing occupies the backup path yet.
+//
+// Lstat, not Stat. A DANGLING symlink there passes a Stat check as "not
+// present", and the copy would then follow it — writing the backup through the
+// link to wherever it points. For the identity file that means ~/.claude.json,
+// which can carry MCP server credentials, landing somewhere never intended. Any
+// existing entry, link included, is a refusal, and a lookup that fails for any
+// other reason stops the backup rather than guessing.
+func backupPathIsFree(path string) error {
+	_, err := os.Lstat(path)
+	switch {
+	case err == nil:
+		return fmt.Errorf("backup %s already exists; move it away first", path)
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	default:
+		return fmt.Errorf("check backup path %s: %w", path, err)
+	}
 }
 
 func copyOne(src, dst string) error {
@@ -256,11 +340,30 @@ func copyOne(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	// Copy the source's permissions, don't invent them. ~/.claude is full of
+	// 0600 transcripts and the identity file beside it is 0600 too; os.Create
+	// would widen every one of them to 0644 in the backup, so the act of
+	// protecting this data would be what exposed it.
+	mode := os.FileMode(0o600)
+	if fi, serr := in.Stat(); serr == nil {
+		mode = fi.Mode().Perm()
+	}
+	// O_EXCL, and no O_TRUNC. backupPathIsFree checked that nothing occupied
+	// this path, but that check and this open are two moments: a symlink
+	// created in between would otherwise be FOLLOWED here and its target
+	// overwritten — for the identity file, one that can carry MCP credentials.
+	// O_CREATE|O_EXCL fails on any existing entry, a dangling symlink included,
+	// which closes the window instead of narrowing it. Every destination is a
+	// path nothing should hold yet, so nothing legitimate is refused.
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	// OpenFile's mode only applies when it creates the file, and umask can clip
+	// it even then — restate it so the backup matches the source exactly.
+	return os.Chmod(dst, mode)
 }
